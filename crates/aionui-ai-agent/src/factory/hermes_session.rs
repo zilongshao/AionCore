@@ -18,6 +18,8 @@ struct ResolvedHermesProvider {
     base_url: String,
     api_key: String,
     model: String,
+    provider_type: String,
+    context_limit: Option<i64>,
 }
 
 struct HermesSessionOverlay {
@@ -91,17 +93,29 @@ async fn build_session_overlay(
         .ok_or_else(|| AgentError::internal("Hermes session home is not valid UTF-8"))?
         .to_owned();
 
-    Ok(HermesSessionOverlay {
-        env: vec![
-            env_var("OPENAI_BASE_URL", provider.base_url),
-            env_var("OPENAI_API_KEY", provider.api_key),
-            env_var("HERMES_INFERENCE_MODEL", provider.model),
-            env_var("HERMES_HOME", home_value),
-            env_var("HERMES_DISABLE_LAZY_INSTALLS", "1"),
-            env_var("HERMES_ACP_SKIP_CONFIGURED_MCP", "1"),
-            env_var("HERMES_ACP_TOOLSET", "hermes-acp-lite"),
-        ],
-    })
+    info!(
+        conversation_id,
+        hermes_provider_type = %provider.provider_type,
+        context_length_supplied = provider.context_limit.is_some(),
+        context_length = provider.context_limit.unwrap_or_default(),
+        "Resolved Aion-managed Hermes provider transport"
+    );
+
+    let mut env = vec![
+        env_var("OPENAI_BASE_URL", provider.base_url),
+        env_var("OPENAI_API_KEY", provider.api_key),
+        env_var("HERMES_INFERENCE_MODEL", provider.model),
+        env_var("HERMES_PROVIDER_TYPE", provider.provider_type),
+        env_var("HERMES_HOME", home_value),
+        env_var("HERMES_DISABLE_LAZY_INSTALLS", "1"),
+        env_var("HERMES_ACP_SKIP_CONFIGURED_MCP", "1"),
+        env_var("HERMES_ACP_TOOLSET", "hermes-acp-lite"),
+    ];
+    if let Some(context_limit) = provider.context_limit {
+        env.push(env_var("HERMES_CONTEXT_LENGTH", context_limit.to_string()));
+    }
+
+    Ok(HermesSessionOverlay { env })
 }
 
 fn absolute_data_dir(data_dir: &Path) -> Result<PathBuf, AgentError> {
@@ -164,7 +178,34 @@ async fn resolve_provider(
         base_url: base_url.to_owned(),
         api_key,
         model: model_id,
+        provider_type: hermes_provider_type(&row.platform, base_url).to_owned(),
+        context_limit: row.context_limit.filter(|limit| *limit > 0),
     })
+}
+
+fn hermes_provider_type(platform: &str, base_url: &str) -> &'static str {
+    match platform.trim() {
+        // AionUI's `openai` platform also represents OpenAI-compatible
+        // corporate gateways. Keep those on Hermes' generic transport: the
+        // named OpenAI provider may select OpenAI-only request semantics (for
+        // example Responses API for GPT-5-family model names).
+        "openai" if is_official_openai_base_url(base_url) => "openai",
+        "openai" => "custom",
+        "gemini" => "gemini",
+        "minimax" => "minimax",
+        "dashscope-coding" => "alibaba-coding-plan",
+        "ollama" => "ollama",
+        _ => "custom",
+    }
+}
+
+fn is_official_openai_base_url(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .map(|rest| rest == "api.openai.com" || rest.starts_with("api.openai.com/"))
+        .unwrap_or(false)
 }
 
 fn effective_model(model: &ProviderWithModel) -> Result<String, AgentError> {
@@ -366,6 +407,26 @@ mod tests {
             "default-model"
         );
         assert!(effective_model(&selected_model("provider", "  ", Some(" "))).is_err());
+    }
+
+    #[test]
+    fn hermes_provider_type_preserves_supported_provider_identity() {
+        assert_eq!(hermes_provider_type("openai", "https://api.openai.com/v1"), "openai");
+        assert_eq!(
+            hermes_provider_type("openai", "https://llm.company.internal/v1"),
+            "custom"
+        );
+        assert_eq!(hermes_provider_type("gemini", "https://example.com"), "gemini");
+        assert_eq!(hermes_provider_type("minimax", "https://example.com"), "minimax");
+        assert_eq!(
+            hermes_provider_type("dashscope-coding", "https://example.com"),
+            "alibaba-coding-plan"
+        );
+        assert_eq!(hermes_provider_type("ollama", "http://localhost:11434/v1"), "ollama");
+        assert_eq!(
+            hermes_provider_type("company-internal", "https://example.com"),
+            "custom"
+        );
     }
 
     #[tokio::test]
@@ -599,6 +660,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_overlay_passes_context_limit_and_provider_type() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let encrypted = encrypt_string("secret", &TEST_KEY).unwrap();
+        repo.create(CreateProviderParams {
+            id: Some("provider"),
+            platform: "openai",
+            name: "provider",
+            base_url: "https://provider.internal/v1",
+            api_key_encrypted: &encrypted,
+            models: r#"["model-a"]"#,
+            enabled: true,
+            capabilities: "[]",
+            context_limit: Some(200_000),
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}",
+            bedrock_config: None,
+            is_full_url: false,
+        })
+        .await
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+
+        let overlay = build_session_overlay(
+            &selected_model("provider", "model-a", None),
+            repo.as_ref(),
+            &TEST_KEY,
+            temp.path(),
+            "conversation",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(env_value(&overlay.env, "HERMES_CONTEXT_LENGTH"), Some("200000"));
+        assert_eq!(env_value(&overlay.env, "HERMES_PROVIDER_TYPE"), Some("custom"));
+    }
+
+    #[tokio::test]
     async fn apply_if_hermes_forces_session_values_after_existing_env() {
         let db = init_database_memory().await.unwrap();
         let repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
@@ -640,6 +741,8 @@ mod tests {
         );
         assert_eq!(env_value(&command_spec.env, "OPENAI_API_KEY"), Some("session-key"));
         assert_eq!(env_value(&command_spec.env, "HERMES_INFERENCE_MODEL"), Some("model-b"));
+        assert_eq!(env_value(&command_spec.env, "HERMES_PROVIDER_TYPE"), Some("custom"));
+        assert_eq!(env_value(&command_spec.env, "HERMES_CONTEXT_LENGTH"), None);
         assert_eq!(env_value(&command_spec.env, "HERMES_DISABLE_LAZY_INSTALLS"), Some("1"));
         assert_eq!(
             env_value(&command_spec.env, "HERMES_ACP_SKIP_CONFIGURED_MCP"),

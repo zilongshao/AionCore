@@ -1,18 +1,26 @@
 diff --git a/acp_adapter/entry.py b/acp_adapter/entry.py
-index 5048b70..956aa46 100644
+index 5048b702..6988d09a 100644
 --- a/acp_adapter/entry.py
 +++ b/acp_adapter/entry.py
-@@ -32,6 +32,7 @@ else:
- import argparse
- import asyncio
+@@ -34,3 +34,5 @@ import asyncio
  import logging
 +import os
  import sys
++import time
  from pathlib import Path
- from hermes_constants import get_hermes_home
-@@ -251,11 +252,12 @@ def main(argv: list[str] | None = None) -> None:
-     # MCP servers dynamically via asyncio.to_thread inside the event
-     # loop; that path is unaffected.)  Moved from model_tools.py module
+@@ -38,2 +40,4 @@ from hermes_constants import get_hermes_home
+
++_PROCESS_STARTED_AT = time.perf_counter()
++
+
+@@ -238,2 +242,6 @@ def main(argv: list[str] | None = None) -> None:
+     logger = logging.getLogger(__name__)
++    logger.info(
++        "Aion startup timing stage=process_ready duration_ms=%d",
++        int((time.perf_counter() - _PROCESS_STARTED_AT) * 1000),
++    )
+     logger.info("Starting hermes-agent ACP adapter")
+@@ -253,7 +261,8 @@ def main(argv: list[str] | None = None) -> None:
      # scope to avoid freezing the gateway's loop on lazy import (#16856).
 -    try:
 -        from tools.mcp_tool import discover_mcp_tools
@@ -25,17 +33,75 @@ index 5048b70..956aa46 100644
 +            discover_mcp_tools()
 +        except Exception:
 +            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
- 
-     agent = HermesACPAgent()
-     try:
+
+diff --git a/acp_adapter/events.py b/acp_adapter/events.py
+index ab82c0e7..ba692c9e 100644
+--- a/acp_adapter/events.py
++++ b/acp_adapter/events.py
+@@ -103,6 +103,10 @@ def _send_update(
+         return
+-    try:
+-        future.result(timeout=5)
+-    except Exception:
+-        logger.debug("Failed to send ACP update", exc_info=True)
++
++    def _log_delivery_failure(completed: object) -> None:
++        try:
++            completed.result()
++        except Exception:
++            logger.debug("Failed to send ACP update", exc_info=True)
++
++    future.add_done_callback(_log_delivery_failure)
+
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index d86e4065..b4d3e901 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -11,2 +11,3 @@ import logging
+ import os
++import time
+ from collections import defaultdict, deque
+@@ -1386,3 +1387,4 @@ class HermesACPAgent(acp.Agent):
+
+-        logger.info("Prompt on session %s: %s", session_id, user_text[:100])
++        prompt_started = time.perf_counter()
++        logger.info("Prompt started on ACP session %s", session_id)
+
+@@ -1400,2 +1402,3 @@ class HermesACPAgent(acp.Agent):
+         streamed_message = False
++        first_visible_token = False
+
+@@ -1415,5 +1418,18 @@ class HermesACPAgent(acp.Agent):
+             def stream_delta_cb(text: str) -> None:
+-                nonlocal streamed_message
++                nonlocal streamed_message, first_visible_token
+                 if text:
+                     streamed_message = True
++                    if not first_visible_token:
++                        first_visible_token = True
++                        if not getattr(state.agent, "_aion_first_visible_token_logged", False):
++                            state.agent._aion_first_visible_token_logged = True
++                            now = time.perf_counter()
++                            request_started = getattr(state.agent, "_aion_first_model_request_started_at", None)
++                            logger.info(
++                                "Aion startup timing stage=first_visible_token "
++                                "duration_ms=%d model_request_duration_ms=%s session_id=%s",
++                                int((now - prompt_started) * 1000),
++                                int((now - request_started) * 1000) if request_started is not None else "unknown",
++                                session_id,
++                            )
+                 message_cb(text)
+@@ -1440,2 +1456,4 @@ class HermesACPAgent(acp.Agent):
+         agent = state.agent
++        if not hasattr(agent, "_aion_first_prompt_started_at"):
++            agent._aion_first_prompt_started_at = prompt_started
+         agent.tool_progress_callback = tool_progress_cb
 diff --git a/acp_adapter/session.py b/acp_adapter/session.py
-index 6f1e17a..2915384 100644
+index 6f1e17a0..751f9bd9 100644
 --- a/acp_adapter/session.py
 +++ b/acp_adapter/session.py
-@@ -144,6 +144,28 @@ def _expand_acp_enabled_toolsets(
-     return expanded
- 
- 
+@@ -146,2 +146,44 @@ def _expand_acp_enabled_toolsets(
+
 +def _managed_acp_runtime(
 +    *,
 +    requested_provider: str | None,
@@ -50,29 +116,122 @@ index 6f1e17a..2915384 100644
 +        return resolve_runtime_provider(requested=requested_provider or config_provider)
 +
 +    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-+    return resolve_runtime_provider(
-+        requested="custom",
-+        explicit_api_key=api_key or None,
-+        explicit_base_url=base_url,
-+        target_model=selected_model or None,
-+    )
++    managed_provider = os.environ.get("HERMES_PROVIDER_TYPE", "").strip().lower() or "custom"
++    try:
++        runtime = resolve_runtime_provider(
++            requested=managed_provider,
++            explicit_api_key=api_key or None,
++            explicit_base_url=base_url,
++            target_model=selected_model or None,
++        )
++    except Exception:
++        logger.warning(
++            "Aion-managed provider type is unsupported by this Hermes build; "
++            "falling back to custom OpenAI-compatible transport"
++        )
++        runtime = resolve_runtime_provider(
++            requested="custom",
++            explicit_api_key=api_key or None,
++            explicit_base_url=base_url,
++            target_model=selected_model or None,
++        )
++
++    # Hermes normalizes the explicit `ollama` alias to `custom`. Preserve the
++    # host's stronger identity so model metadata can gate native /api/show
++    # probes on an explicitly identified Ollama provider.
++    if managed_provider in {"ollama", "ollama-cloud"}:
++        runtime["provider"] = managed_provider
++    return runtime
 +
 +
  def _clear_task_cwd(task_id: str) -> None:
-     """Remove task-specific cwd overrides for an ACP session."""
-     if not task_id:
-@@ -602,7 +624,6 @@ class SessionManager:
+@@ -158,3 +200,71 @@ def _clear_task_cwd(task_id: str) -> None:
++_ACP_WORKSPACE_FILE_TOOLS = frozenset({"read_file", "search_files", "write_file", "patch"})
++
++
++def _bind_acp_workspace(agent: Any, cwd: str) -> None:
++    """Put the editor workspace next to the task and in each file-tool schema.
++
++    ``model_tools`` memoizes tool definitions and returns shared schema dicts.
++    Keep pristine per-agent copies so concurrent ACP sessions never leak one
++    workspace path into another session's model request.
++    """
++    workspace_root = str(cwd)
++    encoded_root = json.dumps(workspace_root, ensure_ascii=False)
++    workspace_prompt = (
++        "# ACP workspace\n"
++        f"workspace_root is already provided: {encoded_root}\n"
++        "Resolve every relative file path against workspace_root. When the user "
++        "asks to find or read a file, call search_files or read_file before "
++        "answering. Do not ask for the workspace root while workspace_root is "
++        "available."
++    )
++
++    if not hasattr(agent, "_aion_acp_base_ephemeral_prompt"):
++        agent._aion_acp_base_ephemeral_prompt = getattr(
++            agent, "ephemeral_system_prompt", None
++        )
++    base_prompt = agent._aion_acp_base_ephemeral_prompt
++    agent.ephemeral_system_prompt = (
++        f"{base_prompt}\n\n{workspace_prompt}" if base_prompt else workspace_prompt
++    )
++
++    tools = getattr(agent, "tools", None)
++    if not isinstance(tools, list):
++        return
++    if not hasattr(agent, "_aion_acp_base_file_tool_schemas"):
++        agent._aion_acp_base_file_tool_schemas = {
++            tool.get("function", {}).get("name"): copy.deepcopy(tool)
++            for tool in tools
++            if isinstance(tool, dict)
++            and tool.get("function", {}).get("name") in _ACP_WORKSPACE_FILE_TOOLS
++        }
++
++    base_schemas = agent._aion_acp_base_file_tool_schemas
++    for index, tool in enumerate(tools):
++        if not isinstance(tool, dict):
++            continue
++        name = tool.get("function", {}).get("name")
++        base_schema = base_schemas.get(name)
++        if base_schema is None:
++            continue
++        scoped_schema = copy.deepcopy(base_schema)
++        function = scoped_schema["function"]
++        root_guidance = (
++            f"workspace_root: {encoded_root}. Relative paths are supported and "
++            "are resolved against workspace_root."
++        )
++        function["description"] = (
++            f"{root_guidance}\n\n{function.get('description', '')}".rstrip()
++        )
++        path_schema = (
++            function.get("parameters", {}).get("properties", {}).get("path")
++        )
++        if isinstance(path_schema, dict):
++            original = str(path_schema.get("description") or "Path")
++            path_schema["description"] = f"{original}. {root_guidance}"
++        tools[index] = scoped_schema
++    agent.tools = tools
++
++
+ @dataclass
+ class SessionState:
+     """Tracks per-session state for an ACP-managed Hermes agent."""
+@@ -351,6 +461,8 @@ class SessionManager:
+             return None
+         state.cwd = cwd
+         _register_task_cwd(session_id, cwd)
++        state.agent.session_cwd = cwd
++        _bind_acp_workspace(state.agent, cwd)
+         self._persist(state)
+         return state
  
-         from run_agent import AIAgent
+@@ -604,3 +716,2 @@ class SessionManager:
          from hermes_cli.config import load_config
 -        from hermes_cli.runtime_provider import resolve_runtime_provider
  
-         config = load_config()
-         model_cfg = config.get("model")
-@@ -614,26 +635,43 @@ class SessionManager:
-         elif isinstance(model_cfg, str) and model_cfg.strip():
-             default_model = model_cfg.strip()
- 
+@@ -616,7 +727,20 @@ class SessionManager:
+
 -        configured_mcp_servers = [
 -            name
 -            for name, cfg in (config.get("mcp_servers") or {}).items()
@@ -96,21 +255,18 @@ index 6f1e17a..2915384 100644
 +            os.environ.get("HERMES_ACP_TOOLSET", "").strip()
 +            or "hermes-acp"
 +        )
- 
-         kwargs = {
-             "platform": "acp",
+
+@@ -625,3 +751,3 @@ class SessionManager:
              "enabled_toolsets": _expand_acp_enabled_toolsets(
 -                ["hermes-acp"],
 +                [acp_toolset],
                  mcp_server_names=configured_mcp_servers,
-             ),
-             "quiet_mode": True,
-             "session_id": session_id,
+@@ -631,3 +757,3 @@ class SessionManager:
              "session_db": self._get_db(),
 -            "model": model or default_model,
 +            "model": selected_model,
          }
- 
+@@ -635,3 +761,7 @@ class SessionManager:
          try:
 -            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
 +            runtime = _managed_acp_runtime(
@@ -119,54 +275,65 @@ index 6f1e17a..2915384 100644
 +                selected_model=selected_model,
 +            )
              kwargs.update(
-                 {
-                     "provider": runtime.get("provider"),
-diff --git a/acp_adapter/events.py b/acp_adapter/events.py
---- a/acp_adapter/events.py
-+++ b/acp_adapter/events.py
-@@ -101,10 +101,14 @@ def _send_update(
-     )
-     if future is None:
-         return
--    try:
--        future.result(timeout=5)
--    except Exception:
--        logger.debug("Failed to send ACP update", exc_info=True)
-+
-+    def _log_delivery_failure(completed: object) -> None:
-+        try:
-+            completed.result()
-+        except Exception:
-+            logger.debug("Failed to send ACP update", exc_info=True)
-+
-+    future.add_done_callback(_log_delivery_failure)
+@@ -648,11 +776,18 @@ class SessionManager:
+             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
  
- 
- # ------------------------------------------------------------------
+         _register_task_cwd(session_id, cwd)
++        init_started = time.perf_counter()
+         agent = AIAgent(**kwargs)
++        logger.info(
++            "Aion startup timing stage=ai_agent_init duration_ms=%d session_id=%s",
++            int((time.perf_counter() - init_started) * 1000),
++            session_id,
++        )
+         # Codex app-server sessions are spawned lazily on the first turn. Stamp
+         # the ACP workspace onto the agent so the Codex runtime starts from the
+         # editor/session cwd instead of the Hermes daemon's process cwd.
+         agent.session_cwd = cwd
++        _bind_acp_workspace(agent, cwd)
+         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
+         # Route any incidental human-readable agent output to stderr instead.
+         agent._print_fn = _acp_stderr_print
+         return agent
+diff --git a/agent/agent_init.py b/agent/agent_init.py
+index 1eae555c..277374d7 100644
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1749,2 +1749,20 @@ def init_agent(
+
++    # Embedding hosts can provide the already-known model window without
++    # writing provider data into Hermes config.yaml. The explicit value feeds
++    # the existing highest-priority context-length path and avoids network
++    # metadata probes during AIAgent construction.
++    if _config_context_length is None:
++        _host_context_length = os.environ.get("HERMES_CONTEXT_LENGTH", "").strip()
++        if _host_context_length:
++            try:
++                _config_context_length = int(_host_context_length)
++                if _config_context_length <= 0:
++                    raise ValueError
++            except (TypeError, ValueError):
++                _config_context_length = None
++                _ra().logger.warning(
++                    "Ignoring invalid host-provided Hermes context length; "
++                    "expected a positive integer"
++                )
++
+     # Resolve custom_providers list once for reuse below (startup
 diff --git a/agent/coding_context.py b/agent/coding_context.py
 index db38ab3d..9a8eb44d 100644
 --- a/agent/coding_context.py
 +++ b/agent/coding_context.py
-@@ -57,6 +57,7 @@ import os
- import re
- import subprocess
+@@ -59,2 +59,3 @@ import subprocess
  import tempfile
 +import threading
  from dataclasses import dataclass
- from pathlib import Path
- from typing import Any, Optional
-@@ -152,6 +153,8 @@ _MAX_VERIFY_COMMANDS = 8
- _MAX_FACT_FILE_BYTES = 256 * 1024
- 
+@@ -154,2 +155,4 @@ _MAX_FACT_FILE_BYTES = 256 * 1024
  _GIT_TIMEOUT = 2.5
 +_GIT_TIMEOUT_ROOTS: set[str] = set()
 +_GIT_TIMEOUT_ROOTS_LOCK = threading.Lock()
- 
- 
- # Per-model edit-format steering. Matching the edit tool format to how a model
-@@ -689,15 +692,53 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
- 
- 
+
+@@ -691,6 +694,35 @@ def _enabled_mcp_servers(config: Optional[dict[str, Any]]) -> list[str]:
  def _git(cwd: Path, *args: str) -> str:
 +    root_key = os.path.normcase(str(cwd.resolve()))
 +    with _GIT_TIMEOUT_ROOTS_LOCK:
@@ -203,9 +370,7 @@ index db38ab3d..9a8eb44d 100644
 -            ["git", "-C", str(cwd), *args],
 +            command,
              capture_output=True,
-             text=True,
-             timeout=_GIT_TIMEOUT,
-             **_popen_kwargs,
+@@ -700,2 +732,11 @@ def _git(cwd: Path, *args: str) -> str:
          )
 +    except subprocess.TimeoutExpired:
 +        with _GIT_TIMEOUT_ROOTS_LOCK:
@@ -217,16 +382,217 @@ index db38ab3d..9a8eb44d 100644
 +        )
 +        return ""
      except (OSError, subprocess.SubprocessError):
-         return ""
-     return out.stdout.strip() if out.returncode == 0 else ""
+diff --git a/agent/conversation_loop.py b/agent/conversation_loop.py
+index 501e49b5..b7bce910 100644
+--- a/agent/conversation_loop.py
++++ b/agent/conversation_loop.py
+@@ -382,3 +382,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
+     # prompt) — build from scratch.
++    prompt_build_started = time.perf_counter()
+     agent._cached_system_prompt = agent._build_system_prompt(system_message)
++    logger.info(
++        "Aion startup timing stage=system_prompt_generation duration_ms=%d session_id=%s",
++        int((time.perf_counter() - prompt_build_started) * 1000),
++        agent.session_id,
++    )
+
+@@ -1442,2 +1448,12 @@ def run_conversation(
+                 def _perform_api_call(next_api_kwargs):
++                    if not hasattr(agent, "_aion_first_model_request_started_at"):
++                        request_started = time.perf_counter()
++                        agent._aion_first_model_request_started_at = request_started
++                        prompt_started = getattr(agent, "_aion_first_prompt_started_at", request_started)
++                        logger.info(
++                            "Aion startup timing stage=first_model_request_dispatch "
++                            "duration_ms=%d session_id=%s",
++                            int((request_started - prompt_started) * 1000),
++                            agent.session_id,
++                        )
+                     if agent.api_mode == "codex_responses":
+@@ -1472,2 +1488,17 @@ def run_conversation(
+                 )
++
++                if (
++                    hasattr(agent, "_aion_first_model_request_started_at")
++                    and not getattr(agent, "_aion_first_model_request_completed", False)
++                ):
++                    agent._aion_first_model_request_completed = True
++                    logger.info(
++                        "Aion startup timing stage=first_model_request_complete "
++                        "duration_ms=%d session_id=%s",
++                        int(
++                            (time.perf_counter() - agent._aion_first_model_request_started_at)
++                            * 1000
++                        ),
++                        agent.session_id,
++                    )
+
+diff --git a/agent/model_metadata.py b/agent/model_metadata.py
+index 8c56cdf3..fafde149 100644
+--- a/agent/model_metadata.py
++++ b/agent/model_metadata.py
+@@ -113,2 +113,4 @@ _endpoint_model_metadata_cache_time: Dict[str, float] = {}
+ _ENDPOINT_MODEL_CACHE_TTL = 300
++_MODEL_PROBE_TIMEOUT = (1.5, 3.0)
++_OLLAMA_SHOW_TIMEOUT = 2.0
+ # Bounded-lifetime cache: after the first successful probe we remember the
+@@ -204,2 +206,18 @@ _LOCAL_CTX_PROBE_CACHE: Dict[tuple, tuple] = {}
+
++
++def _log_aion_probe_timing(stage: str, started_at: float, outcome: str, **fields: Any) -> None:
++    """Emit a payload-free model probe timing record for startup diagnosis."""
++    suffix = " ".join(f"{key}={value}" for key, value in fields.items())
++    logger.info(
++        "Aion startup timing stage=%s duration_ms=%d outcome=%s%s",
++        stage,
++        int((time.perf_counter() - started_at) * 1000),
++        outcome,
++        f" {suffix}" if suffix else "",
++    )
++
++
++def _is_explicit_ollama_provider(provider: str) -> bool:
++    return (provider or "").strip().lower() in {"ollama", "ollama-cloud"}
++
+ # Thin fallback defaults — only broad model family patterns.
+@@ -973,4 +991,6 @@ def fetch_endpoint_model_metadata(
+     """
++    probe_started = time.perf_counter()
+     normalized = _normalize_base_url(base_url)
+     if not normalized or _is_openrouter_base_url(normalized):
++        _log_aion_probe_timing("models_probe", probe_started, "skipped")
+         return {}
+@@ -981,2 +1001,3 @@ def fetch_endpoint_model_metadata(
+         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
++            _log_aion_probe_timing("models_probe", probe_started, "cache_hit")
+             return cached
+@@ -1001,3 +1022,3 @@ def fetch_endpoint_model_metadata(
+                     headers=headers,
+-                    timeout=(5, 10),
++                    timeout=_MODEL_PROBE_TIMEOUT,
+                     verify=_resolve_requests_verify(),
+@@ -1042,2 +1063,3 @@ def fetch_endpoint_model_metadata(
+                 _endpoint_model_metadata_cache_time[normalized] = time.time()
++                _log_aion_probe_timing("models_probe", probe_started, "success", candidate_count=1)
+                 return cache
+@@ -1049,3 +1071,8 @@ def fetch_endpoint_model_metadata(
+         try:
+-            response = requests.get(url, headers=headers, timeout=(5, 10), verify=_resolve_requests_verify())
++            response = requests.get(
++                url,
++                headers=headers,
++                timeout=_MODEL_PROBE_TIMEOUT,
++                verify=_resolve_requests_verify(),
++            )
+             response.raise_for_status()
+@@ -1096,2 +1123,8 @@ def fetch_endpoint_model_metadata(
+             _endpoint_model_metadata_cache_time[normalized] = time.time()
++            _log_aion_probe_timing(
++                "models_probe",
++                probe_started,
++                "success",
++                candidate_count=len(candidates),
++            )
+             return cache
+@@ -1104,2 +1137,8 @@ def fetch_endpoint_model_metadata(
+     _endpoint_model_metadata_cache_time[normalized] = time.time()
++    _log_aion_probe_timing(
++        "models_probe",
++        probe_started,
++        "failure_cached",
++        candidate_count=len(candidates),
++    )
+     return {}
+@@ -1606,7 +1645,4 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
+
+-    Results are cached in ``_LOCAL_CTX_PROBE_CACHE`` (same 30s TTL,
+-    positive-only — see ``_query_local_context_length``) so back-to-back
+-    resolutions during one startup issue a single POST instead of one per
+-    call site. Failures are never memoized: a server that isn't up yet must
+-    be re-probed once it comes up.
++    Positive and negative results are cached in ``_LOCAL_CTX_PROBE_CACHE`` for
++    30 seconds so a failed native probe is not repeated on the startup path.
+
+@@ -1629,10 +1665,16 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
+     cache_key = ("ollama_show", _strip_provider_prefix(model), base_url.rstrip("/"))
++    probe_started = _time.perf_counter()
+     now = _time.monotonic()
+     cached = _LOCAL_CTX_PROBE_CACHE.get(cache_key)
+     if cached is not None and (now - cached[1]) < _LOCAL_CTX_PROBE_TTL_SECONDS:
++        _log_aion_probe_timing("ollama_show_probe", probe_started, "cache_hit")
+         return cached[0]
+
+     result = _query_ollama_api_show_uncached(model, base_url, api_key=api_key)
+-    if result:  # positive-only — never memoize a failed probe
+-        _LOCAL_CTX_PROBE_CACHE[cache_key] = (result, now)
++    _LOCAL_CTX_PROBE_CACHE[cache_key] = (result, now)
++    _log_aion_probe_timing(
++        "ollama_show_probe",
++        probe_started,
++        "success" if result else "failure_cached",
++    )
+     return result
+@@ -1651,3 +1693,3 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
+     try:
+-        with httpx.Client(timeout=5.0, headers=headers) as client:
++        with httpx.Client(timeout=_OLLAMA_SHOW_TIMEOUT, headers=headers) as client:
+             resp = client.post(f"{server_url}/api/show", json={"name": model})
+@@ -2358,6 +2400,10 @@ def get_model_context_length(
+         if not _is_known_provider_base_url(base_url):
+-            # 2b. Ollama native /api/show — any URL might be an Ollama server
+-            # (local, cloud, or custom hosting).  Non-Ollama servers return
+-            # 404/405 quickly.  Fall through on failure.
+-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
++            # 2b. Ollama native /api/show — only when the embedding host or
++            # configured provider explicitly identified Ollama. Generic custom
++            # gateways must never pay this probe on the startup path.
++            ctx = (
++                _query_ollama_api_show(model, base_url, api_key=api_key)
++                if _is_explicit_ollama_provider(provider)
++                else None
++            )
+             if ctx is not None:
+@@ -2465,25 +2511,11 @@ def get_model_context_length(
+             return ctx
+-    # 5e. Ollama native /api/show probe — runs for providers whose base_url
+-    # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
+-    # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
+-    # custom Ollama hosting).  The OpenAI-compat /v1/models endpoint
+-    # correctly omits context_length per the OpenAI schema, but /api/show
+-    # returns the authoritative GGUF model_info.context_length.
+-    # Known hosted providers (OpenRouter, Anthropic, OpenAI, …) are skipped:
+-    # they are definitively not Ollama, the POST always 404s, and the result
+-    # is never cached for them — so every fresh process used to pay a
+-    # ~300ms blocking HTTP round-trip on the first-turn critical path
+-    # (measured against openrouter.ai; worse on slow DNS).
+-    if base_url:
+-        _inferred_for_probe = _infer_provider_from_url(base_url)
+-        _skip_ollama_probe = (
+-            _inferred_for_probe is not None
+-            and "ollama" not in _inferred_for_probe
+-        )
+-        if not _skip_ollama_probe:
+-            ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
+-            if ctx is not None:
+-                if not _skip_persistent_context_cache(base_url, provider):
+-                    save_context_length(model, base_url, ctx)
+-                return ctx
++    # 5e. Ollama native /api/show probe — explicit provider identity only.
++    # Generic custom gateways stop after their OpenAI-compatible /models
++    # probe instead of speculatively POSTing to an unrelated native endpoint.
++    if base_url and _is_explicit_ollama_provider(provider):
++        ctx = _query_ollama_api_show(model, base_url, api_key=api_key)
++        if ctx is not None:
++            if not _skip_persistent_context_cache(base_url, provider):
++                save_context_length(model, base_url, ctx)
++            return ctx
+     # 5f. OpenRouter live /models metadata — authoritative for OpenRouter-routed
 diff --git a/toolsets.py b/toolsets.py
-index 1be6278..a480a16 100644
+index 1be62780..a480a164 100644
 --- a/toolsets.py
 +++ b/toolsets.py
-@@ -396,6 +396,19 @@ TOOLSETS = {
-         "includes": []
-     },
- 
+@@ -398,2 +398,15 @@ TOOLSETS = {
+
 +    "hermes-acp-lite": {
 +        "description": "Managed editor integration with local coding, task, and memory tools",
 +        "tools": [
@@ -241,5 +607,3 @@ index 1be6278..a480a16 100644
 +    },
 +
      "hermes-api-server": {
-         "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
-         "tools": [

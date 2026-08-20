@@ -14,7 +14,7 @@ use aionui_api_types::{
     ImportAssistantsRequest, ImportAssistantsResult, ImportError, SetAssistantStateRequest, UpdateAssistantRequest,
     assistant_avatar_response_value_with_version, is_local_avatar_value,
 };
-use aionui_common::{generate_prefixed_id, now_ms};
+use aionui_common::{AgentType, generate_prefixed_id, now_ms};
 use aionui_db::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantRow, CreateAssistantParams, IAssistantDefinitionRepository,
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
@@ -457,11 +457,23 @@ impl AssistantService {
     }
 
     async fn reconcile_generated_assistants(&self) -> Result<Vec<AgentManagementRow>, AssistantError> {
+        fn is_normal_cli_candidate(row: &AgentManagementRow) -> bool {
+            (row.agent_type == AgentType::Aionrs && row.agent_source == AgentSource::Internal)
+                || (row.agent_type == AgentType::Acp
+                    && row.agent_source == AgentSource::Builtin
+                    && row.backend.as_deref() == Some("hermes"))
+        }
+
         let Some(agent_catalog) = &self.agent_catalog else {
             return Ok(Vec::new());
         };
 
-        let rows = agent_catalog.list_management_agents().await?;
+        let rows: Vec<AgentManagementRow> = agent_catalog
+            .list_management_agents()
+            .await?
+            .into_iter()
+            .filter(is_normal_cli_candidate)
+            .collect();
         let definitions = self.definition_repo.list().await.map_err(|e| {
             AssistantError::Internal(format!("list assistant definitions for generated reconcile: {e}"))
         })?;
@@ -3402,6 +3414,24 @@ mod tests {
         }
     }
 
+    fn mk_hermes_agent_row(
+        id: &str,
+        status: aionui_api_types::AgentManagementStatus,
+    ) -> aionui_api_types::AgentManagementRow {
+        mk_agent_row(id, "hermes", status)
+    }
+
+    fn mk_aionrs_agent_row(
+        id: &str,
+        status: aionui_api_types::AgentManagementStatus,
+    ) -> aionui_api_types::AgentManagementRow {
+        let mut row = mk_agent_row(id, "aionrs", status);
+        row.backend = None;
+        row.agent_type = aionui_common::AgentType::Aionrs;
+        row.agent_source = aionui_api_types::AgentSource::Internal;
+        row
+    }
+
     fn mk_uninstalled_agent_row(id: &str, backend: &str) -> aionui_api_types::AgentManagementRow {
         let mut row = mk_agent_row(id, backend, aionui_api_types::AgentManagementStatus::Unchecked);
         row.installed = false;
@@ -3629,8 +3659,8 @@ mod tests {
         {
             let mut rows = fx.agent_rows.lock().expect("agent rows lock poisoned");
             *rows = vec![
-                mk_agent_row("agent-dirty", "dirty", aionui_api_types::AgentManagementStatus::Online),
-                mk_agent_row("agent-valid", "valid", aionui_api_types::AgentManagementStatus::Online),
+                mk_hermes_agent_row("agent-dirty", aionui_api_types::AgentManagementStatus::Online),
+                mk_hermes_agent_row("agent-valid", aionui_api_types::AgentManagementStatus::Online),
             ];
         }
 
@@ -3731,9 +3761,8 @@ mod tests {
         fx.agent_rows
             .lock()
             .expect("agent rows lock poisoned")
-            .push(mk_agent_row(
+            .push(mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             ));
         fx.definition_repo
@@ -3788,9 +3817,8 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_materializes_generated_assistant_from_available_agent() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -3816,11 +3844,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_materializes_generated_assistant_from_unchecked_agent() {
-        let mut unchecked_row = mk_agent_row(
-            "agent-cursor",
-            "cursor",
-            aionui_api_types::AgentManagementStatus::Unchecked,
-        );
+        let mut unchecked_row = mk_hermes_agent_row("agent-cursor", aionui_api_types::AgentManagementStatus::Unchecked);
         unchecked_row.last_check_status = None;
         unchecked_row.last_check_kind = None;
         unchecked_row.last_check_at = None;
@@ -3847,7 +3871,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_skips_generated_assistant_for_uninstalled_unchecked_agent() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_uninstalled_agent_row("agent-snow", "snow")],
+            agent_rows: vec![mk_uninstalled_agent_row("agent-snow", "hermes")],
             ..Default::default()
         })
         .await;
@@ -3870,7 +3894,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_hides_existing_generated_assistant_when_agent_is_uninstalled_until_installed() {
-        let mut uninstalled_row = mk_uninstalled_agent_row("agent-snow", "snow");
+        let mut uninstalled_row = mk_uninstalled_agent_row("agent-snow", "hermes");
         uninstalled_row.status = aionui_api_types::AgentManagementStatus::Offline;
         let fx = fixture_with_options(FixtureOpts {
             agent_rows: vec![uninstalled_row],
@@ -4416,9 +4440,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_upgrades_empty_generated_auto_skill_defaults_to_fixed() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -4448,7 +4471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_materializes_generated_assistant_from_available_custom_agent() {
+    async fn bootstrap_only_materializes_normal_cli_candidates() {
         let mut custom_row = mk_agent_row(
             "custom-agent-1",
             "custom",
@@ -4457,23 +4480,72 @@ mod tests {
         custom_row.name = "Custom ACP Agent".into();
         custom_row.agent_source = aionui_api_types::AgentSource::Custom;
 
+        let aionrs_row = mk_aionrs_agent_row("agent-aionrs", aionui_api_types::AgentManagementStatus::Online);
+        let hermes_row = mk_hermes_agent_row("agent-hermes", aionui_api_types::AgentManagementStatus::Online);
+
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![custom_row],
+            agent_rows: vec![
+                aionrs_row,
+                hermes_row,
+                mk_agent_row(
+                    "agent-claude",
+                    "claude",
+                    aionui_api_types::AgentManagementStatus::Online,
+                ),
+                mk_agent_row("agent-codex", "codex", aionui_api_types::AgentManagementStatus::Online),
+                custom_row,
+            ],
             ..Default::default()
         })
         .await;
 
         let list = fx.service.list().await.unwrap();
-        let bare = list
+        let generated_ids: Vec<&str> = list
             .iter()
-            .find(|assistant| assistant.id == "bare:custom-agent-1")
-            .expect("available custom agent should be materialized as a generated assistant");
-        assert_eq!(bare.source, AssistantSource::Generated);
-        assert_eq!(bare.name, "Custom ACP Agent");
-        assert_eq!(bare.agent_id, "custom-agent-1");
-        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Online);
-        assert!(bare.team_selectable);
-        assert!(!bare.deletable);
+            .filter(|assistant| assistant.source == AssistantSource::Generated)
+            .map(|assistant| assistant.id.as_str())
+            .collect();
+        assert_eq!(generated_ids, ["bare:agent-aionrs", "bare:agent-hermes"]);
+
+        for excluded_id in ["agent-claude", "agent-codex", "custom-agent-1"] {
+            assert!(
+                fx.definition_repo
+                    .get_by_assistant_id(&format!("bare:{excluded_id}"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "excluded CLI candidates must not be materialized"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_hides_existing_generated_assistant_for_excluded_cli_without_deleting_definition() {
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![mk_agent_row(
+                "agent-claude",
+                "claude",
+                aionui_api_types::AgentManagementStatus::Online,
+            )],
+            ..Default::default()
+        })
+        .await;
+        insert_generated_definition(&fx, "asstdef-generated-claude", "bare:agent-claude", "agent-claude").await;
+
+        let list = fx.service.list().await.unwrap();
+        assert!(list.iter().all(|assistant| assistant.id != "bare:agent-claude"));
+        assert!(matches!(
+            fx.service.get("bare:agent-claude").await,
+            Err(AssistantError::NotFound(_))
+        ));
+        assert!(
+            fx.definition_repo
+                .get_by_assistant_id("bare:agent-claude")
+                .await
+                .unwrap()
+                .is_some(),
+            "excluded historical generated definitions must remain recoverable"
+        );
     }
 
     #[tokio::test]
@@ -4482,13 +4554,7 @@ mod tests {
         // `backend` empty (it is an ACP-vendor label). The generated assistant must
         // still expose the concrete agent id so the frontend does not bind it
         // through an overloaded runtime backend label.
-        let mut agent_row = mk_agent_row(
-            "agent-aionrs",
-            "aionrs",
-            aionui_api_types::AgentManagementStatus::Online,
-        );
-        agent_row.backend = None;
-        agent_row.agent_type = aionui_common::AgentType::Aionrs;
+        let agent_row = mk_aionrs_agent_row("agent-aionrs", aionui_api_types::AgentManagementStatus::Online);
 
         let fx = fixture_with_options(FixtureOpts {
             agent_rows: vec![agent_row],
@@ -4510,13 +4576,7 @@ mod tests {
         // agent row by `agent_type` ("aionrs"), since that row's `backend` is
         // NULL. Matching on `backend` alone left the row unresolved and
         // mislabelled every aionrs assistant as Missing/unavailable.
-        let mut aionrs_row = mk_agent_row(
-            "agent-aionrs",
-            "aionrs",
-            aionui_api_types::AgentManagementStatus::Online,
-        );
-        aionrs_row.backend = None;
-        aionrs_row.agent_type = aionui_common::AgentType::Aionrs;
+        let aionrs_row = mk_aionrs_agent_row("agent-aionrs", aionui_api_types::AgentManagementStatus::Online);
 
         let mut builtin = mk_builtin("builtin-aionrs", "Aion Assistant");
         builtin.agent_ref = "aionrs".into();
@@ -4545,12 +4605,8 @@ mod tests {
         let fx = fixture_with_options(FixtureOpts {
             builtins: vec![mk_builtin("builtin-office", "Office")],
             agent_rows: vec![
-                mk_agent_row(
-                    "agent-claude",
-                    "claude",
-                    aionui_api_types::AgentManagementStatus::Online,
-                ),
-                mk_agent_row("agent-codex", "codex", aionui_api_types::AgentManagementStatus::Online),
+                mk_hermes_agent_row("agent-claude", aionui_api_types::AgentManagementStatus::Online),
+                mk_hermes_agent_row("agent-codex", aionui_api_types::AgentManagementStatus::Online),
             ],
             ..Default::default()
         })
@@ -4576,9 +4632,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_generated_assistants_preserves_existing_user_sort_order() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5073,9 +5128,8 @@ mod tests {
     #[tokio::test]
     async fn update_generated_rejects() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5099,9 +5153,8 @@ mod tests {
     #[tokio::test]
     async fn update_generated_persists_editable_fields() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5164,9 +5217,8 @@ mod tests {
     #[tokio::test]
     async fn update_generated_rejects_identity_fields() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5216,9 +5268,8 @@ mod tests {
     #[tokio::test]
     async fn reconcile_generated_assistant_refreshes_identity_without_overwriting_edits() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5885,9 +5936,8 @@ mod tests {
     #[tokio::test]
     async fn write_rule_generated_then_read_returns_same() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5947,9 +5997,8 @@ mod tests {
     #[tokio::test]
     async fn generated_rule_with_requested_locale_falls_back_to_legacy_locale_less_path() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_aionrs_agent_row(
                 "632f31d2",
-                "aionrs",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -5986,9 +6035,8 @@ mod tests {
     #[tokio::test]
     async fn delete_rule_generated_removes_local_rule() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -6006,9 +6054,8 @@ mod tests {
     #[tokio::test]
     async fn write_skill_generated_then_read_returns_same() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()
@@ -6025,9 +6072,8 @@ mod tests {
     #[tokio::test]
     async fn delete_skill_generated_removes_local_skill() {
         let fx = fixture_with_options(FixtureOpts {
-            agent_rows: vec![mk_agent_row(
+            agent_rows: vec![mk_hermes_agent_row(
                 "agent-claude",
-                "claude",
                 aionui_api_types::AgentManagementStatus::Online,
             )],
             ..Default::default()

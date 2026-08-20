@@ -39,6 +39,23 @@ function Invoke-Checked {
     }
 }
 
+function Copy-DirectoryTreeLongPathSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    & robocopy.exe $Source $Destination /E /COPY:DAT /DCOPY:DAT /R:2 /W:1 /XJ /NFL /NDL /NJH /NJS /NP | Out-Null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ge 8) {
+        throw "robocopy failed with exit code $exitCode while staging portable Python"
+    }
+}
+
 function Get-VerifiedDownload {
     param(
         [Parameter(Mandatory = $true)]
@@ -174,8 +191,10 @@ if ([string]::IsNullOrWhiteSpace($outputLeaf) -or [string]::IsNullOrWhiteSpace($
 
 New-Item -ItemType Directory -Path $outputParent -Force | Out-Null
 $workRoot = Join-Path ([IO.Path]::GetTempPath()) ("aion-hermes-build-" + [Guid]::NewGuid().ToString("N"))
-$swapRoot = Join-Path $outputParent ("." + $outputLeaf + ".new-" + [Guid]::NewGuid().ToString("N"))
-$backupRoot = Join-Path $outputParent ("." + $outputLeaf + ".old-" + [Guid]::NewGuid().ToString("N"))
+# Keep staging names short: Python dependencies contain deep paths, and
+# repeating the runtime leaf plus a full GUID can push PowerShell past MAX_PATH.
+$swapRoot = Join-Path $outputParent (".new-" + [IO.Path]::GetRandomFileName())
+$backupRoot = Join-Path $outputParent (".old-" + [IO.Path]::GetRandomFileName())
 
 try {
     New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
@@ -250,7 +269,10 @@ try {
         throw "Expected one portable python.exe, found $($pythonCandidates.Count)"
     }
     $pythonHome = Split-Path -Parent $pythonCandidates[0]
-    Move-Item -LiteralPath $pythonHome -Destination (Join-Path $swapRoot "python")
+    # Windows PowerShell's Move-Item recursively enumerates cross-volume moves
+    # and can fail when the final bundle path exceeds MAX_PATH. Robocopy handles
+    # the long destination tree; workRoot cleanup removes the source afterward.
+    Copy-DirectoryTreeLongPathSafe $pythonHome (Join-Path $swapRoot "python")
     $pythonExe = Join-Path $swapRoot "python\python.exe"
 
     $pythonVersion = (& $pythonExe --version).Trim()
@@ -283,7 +305,7 @@ try {
     )
 
     # Install the official wheel by its release hash, then overlay only the
-    # five audited files changed by the pinned Aion patch. This avoids an
+    # audited files changed by the pinned Aion patch. This avoids an
     # unpinned PEP 517 build environment while keeping the patch reviewable.
     $wheel = Join-Path $workRoot "hermes_agent-0.19.0-py3-none-any.whl"
     Get-VerifiedDownload $lock.hermesWheel $wheel $lock.hermesWheelSha256
@@ -302,7 +324,17 @@ try {
     if (-not (Test-Path -LiteralPath $sitePackages -PathType Container)) {
         throw "Failed to locate portable Python site-packages"
     }
-    foreach ($relative in @("acp_adapter\entry.py", "acp_adapter\events.py", "acp_adapter\session.py", "agent\coding_context.py", "toolsets.py")) {
+    foreach ($relative in @(
+        "acp_adapter\entry.py",
+        "acp_adapter\events.py",
+        "acp_adapter\server.py",
+        "acp_adapter\session.py",
+        "agent\agent_init.py",
+        "agent\coding_context.py",
+        "agent\conversation_loop.py",
+        "agent\model_metadata.py",
+        "toolsets.py"
+    )) {
         $installedFile = Join-Path $sitePackages $relative
         if (-not (Test-Path -LiteralPath $installedFile -PathType Leaf)) {
             throw "Official Hermes wheel is missing $relative under $sitePackages"

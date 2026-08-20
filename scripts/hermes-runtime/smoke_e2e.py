@@ -14,6 +14,7 @@ sys.dont_write_bytecode = True
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -26,6 +27,9 @@ from typing import Any
 
 REPLY = "HERMES_E2E_OK"
 PROMPT = "Reply with HERMES_E2E_OK and do not call tools."
+WORKSPACE_FILE = "资料 文件.txt"
+WORKSPACE_MARKER = "AION_WORKSPACE_RELATIVE_READ_OK"
+WORKSPACE_PROMPT = f"读取 `{WORKSPACE_FILE}`，并逐字返回文件内容。"
 MODEL = "aion-hermes-e2e-model"
 FORBIDDEN_TOOL_PREFIXES = ("browser_", "web_")
 REQUIRED_TOOLS = {"read_file", "terminal"}
@@ -35,6 +39,7 @@ class EndpointState:
     def __init__(self, secret: str) -> None:
         self.secret = secret
         self.requests: list[dict[str, Any]] = []
+        self.workspace_root: Path | None = None
 
 
 def _tool_names(body: dict[str, Any]) -> list[str]:
@@ -48,6 +53,34 @@ def _tool_names(body: dict[str, Any]) -> list[str]:
     return sorted(names)
 
 
+def _message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "".join(
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _last_user_text(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages") or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _message_text(message)
+    return ""
+
+
+def _tool_description(body: dict[str, Any], name: str) -> str:
+    for tool in body.get("tools") or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and function.get("name") == name:
+            return str(function.get("description") or "")
+    return ""
+
+
 def _handler_for(state: EndpointState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -59,14 +92,44 @@ def _handler_for(state: EndpointState) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length) or b"{}")
             authorization = self.headers.get("Authorization", "")
+            messages = body.get("messages") or []
+            last_message = messages[-1] if messages else {}
+            is_workspace_turn = WORKSPACE_PROMPT in _last_user_text(body)
+            has_tool_result = (
+                is_workspace_turn
+                and isinstance(last_message, dict)
+                and last_message.get("role") == "tool"
+            )
+            encoded_root = (
+                json.dumps(str(state.workspace_root), ensure_ascii=False)
+                if state.workspace_root is not None
+                else ""
+            )
+            system_text = (
+                _message_text(messages[0])
+                if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system"
+                else ""
+            )
             state.requests.append(
                 {
                     "path": self.path,
                     "model": body.get("model"),
                     "stream": body.get("stream"),
-                    "messageCount": len(body.get("messages") or []),
+                    "messageCount": len(messages),
                     "toolNames": _tool_names(body),
                     "authorizationAccepted": authorization == f"Bearer {state.secret}",
+                    "scenario": "workspace" if is_workspace_turn else "baseline",
+                    "lastMessageRole": last_message.get("role") if isinstance(last_message, dict) else None,
+                    "systemHasWorkspaceRoot": bool(encoded_root and encoded_root in system_text),
+                    "readDescriptionHasWorkspaceRoot": bool(
+                        encoded_root and encoded_root in _tool_description(body, "read_file")
+                    ),
+                    "searchDescriptionHasWorkspaceRoot": bool(
+                        encoded_root and encoded_root in _tool_description(body, "search_files")
+                    ),
+                    "toolResultHasMarker": bool(
+                        has_tool_result and WORKSPACE_MARKER in _message_text(last_message)
+                    ),
                 }
             )
 
@@ -85,6 +148,30 @@ def _handler_for(state: EndpointState) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
+                if is_workspace_turn and not has_tool_result:
+                    delta = {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-aion-workspace-read",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": json.dumps(
+                                        {"path": WORKSPACE_FILE}, ensure_ascii=False
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                    finish_reason = "tool_calls"
+                else:
+                    delta = {
+                        "role": "assistant",
+                        "content": WORKSPACE_MARKER if is_workspace_turn else REPLY,
+                    }
+                    finish_reason = "stop"
                 chunks = [
                     {
                         "id": "chatcmpl-aion-hermes-e2e",
@@ -92,11 +179,7 @@ def _handler_for(state: EndpointState) -> type[BaseHTTPRequestHandler]:
                         "created": 1,
                         "model": MODEL,
                         "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"role": "assistant", "content": REPLY},
-                                "finish_reason": None,
-                            }
+                            {"index": 0, "delta": delta, "finish_reason": None}
                         ],
                     },
                     {
@@ -104,7 +187,9 @@ def _handler_for(state: EndpointState) -> type[BaseHTTPRequestHandler]:
                         "object": "chat.completion.chunk",
                         "created": 1,
                         "model": MODEL,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": finish_reason}
+                        ],
                         "usage": {
                             "prompt_tokens": 10,
                             "completion_tokens": 4,
@@ -183,6 +268,31 @@ def _extract_agent_text(updates: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _first_turn_action(updates: list[dict[str, Any]]) -> tuple[str, str | None]:
+    for notification in updates:
+        update = notification.get("update") or {}
+        update_type = update.get("sessionUpdate")
+        if update_type == "tool_call":
+            return "tool", update.get("kind")
+        if update_type == "agent_message_chunk":
+            content = update.get("content") or {}
+            if content.get("type") == "text" and content.get("text"):
+                return "message", None
+    return "none", None
+
+
+async def _wait_for_first_turn_action(
+    client: RecordingClient, start: int, timeout: float = 30
+) -> tuple[str, str | None]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        action = _first_turn_action(client.updates[start:])
+        if action[0] != "none":
+            return action
+        await asyncio.sleep(0.05)
+    return "none", None
+
+
 def _sanitize(value: Any, replacements: dict[str, str]) -> Any:
     if isinstance(value, dict):
         return {key: _sanitize(item, replacements) for key, item in value.items()}
@@ -196,10 +306,13 @@ def _sanitize(value: Any, replacements: dict[str, str]) -> Any:
     return value
 
 
-async def _read_stderr(process: asyncio.subprocess.Process) -> list[str]:
+async def _read_stderr(
+    process: asyncio.subprocess.Process, lines: list[str] | None = None
+) -> list[str]:
     if process.stderr is None:
         return []
-    lines: list[str] = []
+    if lines is None:
+        lines = []
     while line := await process.stderr.readline():
         lines.append(line.decode("utf-8", errors="replace").rstrip())
     return lines
@@ -231,12 +344,19 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
         wire.append({"direction": event.direction.value, "message": event.message})
 
     try:
-        with tempfile.TemporaryDirectory(prefix="Aion Hermes ACP 中文 ") as temporary:
+        with tempfile.TemporaryDirectory(
+            prefix="Aion Hermes ACP 中文 ", ignore_cleanup_errors=True
+        ) as temporary:
             temp_root = Path(temporary)
             hermes_home = temp_root / "Hermes 会话"
             workspace = temp_root / "ACP 工作区"
             hermes_home.mkdir()
             workspace.mkdir()
+            workspace_file = workspace / WORKSPACE_FILE
+            workspace_file.write_text(WORKSPACE_MARKER, encoding="utf-8")
+            if (workspace / ".git").exists():
+                raise AssertionError("workspace fixture must remain a non-Git directory")
+            endpoint_state.workspace_root = workspace
             (hermes_home / "config.yaml").write_text(
                 "security:\n"
                 "  allow_lazy_installs: false\n"
@@ -247,6 +367,7 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
             )
 
             env = {
+                **os.environ,
                 "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
                 "OPENAI_API_KEY": secret,
                 "HERMES_INFERENCE_MODEL": MODEL,
@@ -262,6 +383,40 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                 "PYTHONUTF8": "1",
                 "PATH": os.pathsep.join([str(rg), str(git), os.environ.get("PATH", "")]),
             }
+            probe_code = (
+                "import sys; "
+                "from tools.terminal_tool import register_task_env_overrides; "
+                "from model_tools import handle_function_call; "
+                "task_id='aion-workspace-probe'; "
+                "register_task_env_overrides(task_id, {'cwd': sys.argv[1]}); "
+                "result=handle_function_call('read_file', {'path': sys.argv[2]}, "
+                "task_id, tool_call_id='probe-call', session_id='probe-session', "
+                "enabled_tools=['read_file'], skip_pre_tool_call_hook=True, "
+                "skip_tool_request_middleware=True, "
+                "enabled_toolsets=['hermes-acp-lite']); "
+                "assert sys.argv[3] in result, result; print(sys.argv[3])"
+            )
+            probe = await asyncio.create_subprocess_exec(
+                str(python),
+                "-P",
+                "-c",
+                probe_code,
+                str(workspace),
+                WORKSPACE_FILE,
+                WORKSPACE_MARKER,
+                cwd=workspace,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            probe_stdout, probe_stderr = await asyncio.wait_for(probe.communicate(), timeout=30)
+            if probe.returncode != 0 or WORKSPACE_MARKER not in probe_stdout.decode(
+                "utf-8", errors="replace"
+            ):
+                raise AssertionError(
+                    "relative workspace file-tool probe failed: "
+                    f"exit={probe.returncode}, stderr_lines={len(probe_stderr.splitlines())}"
+                )
             client = RecordingClient()
             started = time.monotonic()
             stderr_lines: list[str] = []
@@ -275,7 +430,7 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                 cwd=workspace,
                 observers=[observe],
             ) as (connection, process):
-                stderr_task = asyncio.create_task(_read_stderr(process))
+                stderr_task = asyncio.create_task(_read_stderr(process, stderr_lines))
                 initialized = await asyncio.wait_for(
                     connection.initialize(
                         protocol_version=PROTOCOL_VERSION,
@@ -292,6 +447,25 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                     timeout=120,
                 )
                 await asyncio.sleep(0.2)
+                workspace_updates_start = len(client.updates)
+                workspace_prompt_task = asyncio.create_task(
+                    connection.prompt(
+                        prompt=[TextContentBlock(type="text", text=WORKSPACE_PROMPT)],
+                        session_id=session.session_id,
+                    )
+                )
+                first_action, first_action_kind = await _wait_for_first_turn_action(
+                    client, workspace_updates_start
+                )
+                if first_action != "tool" or first_action_kind not in {"read", "search"}:
+                    raise AssertionError(
+                        "workspace read did not begin with a read/search tool action: "
+                        f"{first_action}/{first_action_kind}"
+                    )
+                await connection.cancel(session_id=session.session_id)
+                workspace_prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await workspace_prompt_task
             stderr_lines = await asyncio.wait_for(stderr_task, timeout=5)
 
             if secret in "\n".join(stderr_lines):
@@ -305,9 +479,9 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                 for request in endpoint_state.requests
                 if request["path"].rstrip("/") == "/v1/chat/completions"
             ]
-            if len(model_requests) != 1:
+            if len(model_requests) != 2:
                 raise AssertionError(
-                    "expected one model endpoint request, got "
+                    "expected baseline plus workspace-action model requests, got "
                     f"{json.dumps(endpoint_state.requests, ensure_ascii=False)}"
                 )
 
@@ -323,6 +497,22 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
             missing = sorted(REQUIRED_TOOLS - tools)
             if missing:
                 raise AssertionError(f"required lite tools were absent from the model request: {missing}")
+
+            workspace_requests = [
+                request for request in model_requests if request["scenario"] == "workspace"
+            ]
+            if len(workspace_requests) != 1:
+                raise AssertionError(f"expected one workspace request, got {workspace_requests}")
+            first_workspace_request = workspace_requests[0]
+            for field in (
+                "systemHasWorkspaceRoot",
+                "readDescriptionHasWorkspaceRoot",
+                "searchDescriptionHasWorkspaceRoot",
+            ):
+                if not first_workspace_request[field]:
+                    raise AssertionError(f"workspace contract missing from model request: {field}")
+            if first_workspace_request["lastMessageRole"] != "user":
+                raise AssertionError("workspace tool decision did not follow the user message")
 
             replacements = {
                 str(runtime_root): "<runtime-root>",
@@ -340,6 +530,12 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                 "initialize": initialized.model_dump(mode="json", by_alias=True, exclude_none=True),
                 "sessionId": session.session_id,
                 "promptStopReason": response.stop_reason,
+                "workspacePromptStopReason": "cancelled_after_first_action",
+                "workspaceFirstAction": {
+                    "type": first_action,
+                    "kind": first_action_kind,
+                },
+                "workspaceMarkerReturned": True,
                 "agentText": _extract_agent_text(client.updates),
                 "modelEndpointRequests": endpoint_state.requests,
                 "stderr": {
@@ -371,6 +567,9 @@ def main() -> None:
                 "ok": True,
                 "fixture": result["fixture"],
                 "promptStopReason": result["promptStopReason"],
+                "workspacePromptStopReason": result["workspacePromptStopReason"],
+                "workspaceFirstAction": result["workspaceFirstAction"],
+                "workspaceMarkerReturned": result["workspaceMarkerReturned"],
                 "agentText": result["agentText"],
                 "requestCount": len(result["modelEndpointRequests"]),
                 "modelRequestCount": sum(

@@ -4,7 +4,7 @@ use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::ensure_node_runtime;
 use aionui_runtime::managed_cli::{
-    HERMES_RUNTIME_TARGET, managed_cli_contract_for_export, managed_hermes_contract_for_export,
+    HERMES_RUNTIME_TARGET, current_runtime_key, managed_cli_contract_for_export, managed_hermes_contract_for_export,
     prepare_managed_cli_to_root, prepare_managed_hermes_to_root,
 };
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
@@ -13,13 +13,16 @@ use aionui_runtime::managed_resources_contract::{
 };
 use aionui_runtime::node_runtime::managed_node_contract_for_export;
 
-const MANAGED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
+// Claude and Codex intentionally remain external tools resolved from the user's
+// PATH. The bundled managed-resources pack contains no direct-session CLIs.
+const MANAGED_CLI_NAMES: [&str; 0] = [];
 
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
 pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) -> Result<ExitCode, CliBoundaryError> {
     let output_root = args.bundle_out;
     std::fs::create_dir_all(&output_root).map_err(|_| prepare_managed_resources_error("output.create"))?;
+    let runtime_key = current_runtime_key().ok_or_else(|| prepare_managed_resources_error("contract.write"))?;
 
     let node_runtime = ensure_node_runtime()
         .await
@@ -43,7 +46,7 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
         println!("  {:<6} -> {}", name, prepared.root.display());
         prepared_clis.push(prepared);
     }
-    let prepared_hermes = if aionui_runtime::managed_cli::current_runtime_key() == Some(HERMES_RUNTIME_TARGET) {
+    let prepared_hermes = if runtime_key == HERMES_RUNTIME_TARGET {
         let prepared = prepare_managed_hermes_to_root(&output_root)
             .await
             .map_err(|error| prepare_managed_resources_error_with_detail("hermes.prepare", error))?;
@@ -68,13 +71,9 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
                 .map_err(|error| prepare_managed_resources_error_with_detail("contract.write", error))?,
         );
     }
-    let runtime_key = clis
-        .first()
-        .map(|cli| cli.platform_directory.clone())
-        .ok_or_else(|| prepare_managed_resources_error("contract.write"))?;
     let contract = ManagedResourcesContract {
         schema_version: MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION,
-        runtime_key,
+        runtime_key: runtime_key.to_owned(),
         node,
         clis,
     };
@@ -121,5 +120,10 @@ mod tests {
             assert_eq!(err.code(), CliBoundaryCode::CliPrepareManagedResourcesFailed);
             assert!(err.stderr_line().contains(stage));
         }
+    }
+
+    #[test]
+    fn managed_resources_exclude_direct_session_clis() {
+        assert!(MANAGED_CLI_NAMES.is_empty());
     }
 }

@@ -17,16 +17,21 @@ The upstream sources used to establish the launch contract are:
 - `toolsets.py`: the upstream `hermes-acp` tool inventory.
 - `tools/environments/local.py`: `HERMES_GIT_BASH_PATH` handling.
 
-The patch is intentionally narrow. It adds a browser/web-free
+The patch is intentionally scoped to the managed runtime. It adds a browser/web-free
 `hermes-acp-lite` toolset, lets an embedding host select that toolset, skips
 only globally configured MCP discovery when the host owns `session/new`
 injection, and makes the session-scoped OpenAI-compatible endpoint, API key,
-and model authoritative without writing them to Hermes configuration files.
+model, provider identity, and context length authoritative without writing
+them to Hermes configuration files. Model metadata probes use bounded
+timeouts and negative caching, Ollama's native endpoint is explicitly gated,
+and startup stages emit payload-free duration records. ACP sessions also bind
+the editor workspace into the near-task system instruction and per-session
+file-tool schemas so relative paths resolve without asking for the root again.
 
 `runtime-lock.json` pins every downloaded input. The build script verifies the
 official PyPI sdist and wheel checksums, applies the patch to the sdist with
 context checks, installs a committed hash-locked dependency export generated
-from the upstream `uv.lock`, overlays only the three patched files onto the
+from the upstream `uv.lock`, overlays only the audited patched files onto the
 official wheel installation, and validates the installed adapter before
 export. This avoids both GitHub's dynamically generated source archives and an
 unpinned PEP 517 build environment.

@@ -168,14 +168,14 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-office",
                 "name": "Office",
-                "agent_ref": "codex",
+                "agent_ref": "hermes",
                 "rule_file": "rules/office.{locale}.md",
                 "avatar": "office.png",
             },
             {
                 "id": "builtin-bare",
                 "name": "Bare",
-                "agent_ref": "codex",
+                "agent_ref": "hermes",
             }
         ]
     });
@@ -324,6 +324,7 @@ async fn fixture() -> Fixture {
                 rows: vec![
                     test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
                     test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
+                    test_agent_row("f00hermes", Some("hermes"), AgentType::Acp, "Hermes CLI"),
                     test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
                 ],
             })),
@@ -360,7 +361,7 @@ async fn fixture() -> Fixture {
 // ===========================================================================
 
 #[tokio::test]
-async fn list_populated_excludes_extension_assistants() {
+async fn list_populated_only_includes_normal_generated_cli_candidates() {
     let fx = fixture().await;
 
     let resp = fx
@@ -373,12 +374,11 @@ async fn list_populated_excludes_extension_assistants() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let list = json["data"].as_array().unwrap();
-    // Extension-contributed assistants are no longer part of the unified
-    // assistant catalog.
-    assert_eq!(list.len(), 5, "body = {json}");
+    assert_eq!(list.len(), 4, "body = {json}");
     let ids: Vec<&str> = list.iter().map(|a| a["id"].as_str().unwrap()).collect();
-    assert!(ids.contains(&"bare:8e1acf31"));
-    assert!(ids.contains(&"bare:cc126dd5"));
+    assert!(!ids.contains(&"bare:8e1acf31"));
+    assert!(!ids.contains(&"bare:cc126dd5"));
+    assert!(ids.contains(&"bare:f00hermes"));
     assert!(ids.contains(&"bare:632f31d2"));
     assert!(ids.contains(&"builtin-office"));
     assert!(ids.contains(&"builtin-bare"));
@@ -388,10 +388,10 @@ async fn list_populated_excludes_extension_assistants() {
     assert!(sources.contains(&"builtin"));
     assert!(!sources.contains(&"extension"));
     let office = find_id(&json["data"], "builtin-office").expect("builtin-office missing from assistant list");
-    assert_eq!(office["agent_id"], "8e1acf31");
+    assert_eq!(office["agent_id"], "f00hermes");
     assert_eq!(office["agent"]["type"], "acp");
     assert_eq!(office["agent"]["source"], "builtin");
-    assert_eq!(office["agent"]["acp_backend"], "codex");
+    assert_eq!(office["agent"]["acp_backend"], "hermes");
     assert!(office["agent"].get("backend").is_none());
     assert!(office["agent"].get("id").is_none());
 }
@@ -435,7 +435,7 @@ async fn list_generated_assistant_exposes_generated_runtime_fields() {
     let list = json["data"].as_array().unwrap();
     let generated = list
         .iter()
-        .find(|assistant| assistant["id"] == "bare:8e1acf31")
+        .find(|assistant| assistant["id"] == "bare:f00hermes")
         .expect("generated assistant missing from assistant list");
 
     assert_eq!(generated["source"], "generated");
@@ -537,7 +537,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
             assistant_definition_id: &definition.id,
             enabled: false,
             sort_order: 7,
-            agent_id_override: Some("8e1acf31"),
+            agent_id_override: Some("f00hermes"),
             last_used_at: Some(1_725_000_001_234),
         })
         .await
@@ -570,8 +570,8 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["profile"]["name"], "Mine");
     assert_eq!(data["state"]["enabled"], false);
     assert_eq!(data["state"]["sort_order"], 7);
-    assert_eq!(data["engine"]["agent_id"], "8e1acf31");
-    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert_eq!(data["engine"]["agent_id"], "f00hermes");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "hermes");
     assert!(data["engine"]["agent"].get("backend").is_none());
     assert!(data["engine"]["agent"].get("id").is_none());
     assert_eq!(data["engine"]["agent"]["type"], "acp");
@@ -592,22 +592,22 @@ async fn get_detail_generated_assistant_exposes_generated_runtime_fields() {
     let resp = fx
         .app
         .clone()
-        .oneshot(get_with_token("/api/assistants/bare:8e1acf31?locale=en-US", &fx.token))
+        .oneshot(get_with_token("/api/assistants/bare:f00hermes?locale=en-US", &fx.token))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     let data = &json["data"];
-    assert_eq!(data["id"], "bare:8e1acf31");
+    assert_eq!(data["id"], "bare:f00hermes");
     assert_eq!(data["source"], "generated");
     assert_eq!(data["deletable"], false);
     assert_eq!(data["agent_status"], "online");
     assert_eq!(data["agent_status_message"], Value::Null);
     assert_eq!(data["team_selectable"], true);
     assert_eq!(data["team_block_reason"], Value::Null);
-    assert_eq!(data["engine"]["agent_id"], "8e1acf31");
-    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert_eq!(data["engine"]["agent_id"], "f00hermes");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "hermes");
     assert!(data["engine"]["agent"].get("backend").is_none());
     assert!(data["engine"]["agent"].get("id").is_none());
     assert_eq!(data["engine"]["agent"]["type"], "acp");

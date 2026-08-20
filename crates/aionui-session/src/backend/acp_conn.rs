@@ -88,11 +88,18 @@ impl BackendConnection for AcpConnection {
         if let Some(cwd) = &config.cwd {
             cmd.cwd = Some(cwd.clone());
         }
+        let spawn_started = std::time::Instant::now();
         let proc = self
             .spawner
             .spawn(cmd, &[], "aionui-session")
             .await
             .map_err(|e| BackendError::from_spawn("acp spawn failed", e))?;
+        tracing::info!(
+            conversation_id = %logical_id,
+            stage = "process_spawn",
+            duration_ms = spawn_started.elapsed().as_millis() as u64,
+            "ACP startup stage completed"
+        );
         let io: Box<dyn AgentIo> = Box::new(crate::adapter::ManagedProcessIo::new(proc));
         // F-4 wake recipe: a Dormant→dispatch wake re-spawns the ACP CLI and
         // replays the resume handshake (`session/load` against the bound sid).
@@ -336,6 +343,9 @@ pub struct AcpSessionBackend {
     /// capability the agent advertises at connect — hermes carries it, claude does
     /// not). Symmetric with `pending_open`.
     pending_init: Arc<Mutex<Option<u64>>>,
+    /// Request timestamps for the low-volume ACP startup timing log. Values
+    /// contain only a stage label and monotonic time; no wire payloads.
+    handshake_timings: Arc<Mutex<HashMap<u64, HandshakeTiming>>>,
     /// rpc_id → client_msg_id for in-flight `session/prompt` requests. The reader
     /// claims the response, reads its `stopReason`, and synthesizes the terminal
     /// `TurnResult` (THE ACP-specific terminal path — see the module header).
@@ -375,6 +385,12 @@ type PendingPermOptions = Arc<Mutex<HashMap<String, Vec<(String, String)>>>>;
 struct PendingPrompt {
     /// The turn epoch this prompt opened (stamped on the synthesized TurnResult).
     turn_gen: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HandshakeTiming {
+    stage: &'static str,
+    started_at: std::time::Instant,
 }
 
 /// Reader-discovered models/modes (from the `session/new`|`load` response).
@@ -541,6 +557,7 @@ impl AcpSessionBackend {
         let current_model = Arc::new(Mutex::new(None));
         let pending_open = Arc::new(Mutex::new(None));
         let pending_init = Arc::new(Mutex::new(None));
+        let handshake_timings = Arc::new(Mutex::new(HashMap::new()));
         let pending_prompts = Arc::new(Mutex::new(HashMap::new()));
         let pending_set = Arc::new(Mutex::new(HashMap::new()));
         let pending_perm_options = Arc::new(Mutex::new(HashMap::new()));
@@ -563,6 +580,7 @@ impl AcpSessionBackend {
             current_model: current_model.clone(),
             pending_open: pending_open.clone(),
             pending_init: pending_init.clone(),
+            handshake_timings: handshake_timings.clone(),
             pending_prompts: pending_prompts.clone(),
             pending_set: pending_set.clone(),
             pending_perm_options: pending_perm_options.clone(),
@@ -632,6 +650,7 @@ impl AcpSessionBackend {
             current_model,
             pending_open,
             pending_init,
+            handshake_timings,
             pending_prompts,
             pending_set,
             pending_preamble,
@@ -756,6 +775,13 @@ impl AcpSessionBackend {
         // Register the initialize rpc id so the reader claims its RESPONSE and parses
         // `authMethods[]` (the advertised auth capability) into Discovered.
         self.pending_init.lock().await.replace(init_id);
+        self.handshake_timings.lock().await.insert(
+            init_id,
+            HandshakeTiming {
+                stage: "initialize",
+                started_at: std::time::Instant::now(),
+            },
+        );
         self.write_frame(json!({
             "jsonrpc": "2.0", "id": init_id, "method": "initialize",
             "params": initialize_params()
@@ -763,6 +789,17 @@ impl AcpSessionBackend {
         .await?;
         let id = self.next_rpc_id();
         self.pending_open.lock().await.replace(id);
+        self.handshake_timings.lock().await.insert(
+            id,
+            HandshakeTiming {
+                stage: if resume_sid.is_some() {
+                    "session_load"
+                } else {
+                    "session_new"
+                },
+                started_at: std::time::Instant::now(),
+            },
+        );
         match resume_sid {
             Some(sid) => {
                 // Do NOT pre-seed `acp_session_id` here. The ACP spec requires the
@@ -870,6 +907,7 @@ struct ReaderCtx {
     current_model: Arc<Mutex<Option<String>>>,
     pending_open: Arc<Mutex<Option<u64>>>,
     pending_init: Arc<Mutex<Option<u64>>>,
+    handshake_timings: Arc<Mutex<HashMap<u64, HandshakeTiming>>>,
     pending_prompts: Arc<Mutex<HashMap<u64, PendingPrompt>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_perm_options: PendingPermOptions,
@@ -892,6 +930,7 @@ struct AcpReaderState {
     current_model: Arc<Mutex<Option<String>>>,
     pending_open: Arc<Mutex<Option<u64>>>,
     pending_init: Arc<Mutex<Option<u64>>>,
+    handshake_timings: Arc<Mutex<HashMap<u64, HandshakeTiming>>>,
     pending_prompts: Arc<Mutex<HashMap<u64, PendingPrompt>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
     pending_perm_options: PendingPermOptions,
@@ -923,6 +962,7 @@ fn start_acp_reader(
             current_model: state.current_model,
             pending_open: state.pending_open,
             pending_init: state.pending_init,
+            handshake_timings: state.handshake_timings,
             pending_prompts: state.pending_prompts,
             pending_set: state.pending_set,
             pending_perm_options: state.pending_perm_options,
@@ -980,6 +1020,7 @@ async fn reader_task(ctx: ReaderCtx) {
         current_model,
         pending_open,
         pending_init,
+        handshake_timings,
         pending_prompts,
         pending_set,
         pending_perm_options,
@@ -1081,6 +1122,15 @@ async fn reader_task(ctx: ReaderCtx) {
                         let is_init = *pending_init.lock().await == Some(rid);
                         if is_init {
                             *pending_init.lock().await = None;
+                            if let Some(timing) = handshake_timings.lock().await.remove(&rid) {
+                                tracing::info!(
+                                    conversation_id = %session_id,
+                                    stage = timing.stage,
+                                    duration_ms = timing.started_at.elapsed().as_millis() as u64,
+                                    success = frame.get("result").is_some(),
+                                    "ACP startup stage completed"
+                                );
+                            }
                             if let Some(result) = frame.get("result") {
                                 handle_initialize_response(result, &discovered);
                             } else if frame.get("error").is_some() {
@@ -1104,6 +1154,15 @@ async fn reader_task(ctx: ReaderCtx) {
                         // session/new|load response → bind ACP sid + discovery + BackendBound.
                         let is_open = *pending_open.lock().await == Some(rid);
                         if is_open {
+                            if let Some(timing) = handshake_timings.lock().await.remove(&rid) {
+                                tracing::info!(
+                                    conversation_id = %session_id,
+                                    stage = timing.stage,
+                                    duration_ms = timing.started_at.elapsed().as_millis() as u64,
+                                    success = frame.get("result").is_some(),
+                                    "ACP startup stage completed"
+                                );
+                            }
                             if let Some(result) = frame.get("result") {
                                 handle_open_response(
                                     result,

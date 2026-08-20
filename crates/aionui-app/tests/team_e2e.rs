@@ -1,6 +1,9 @@
 mod common;
 
-use aionui_db::{IConversationRepository, MessagePageDirection, MessagePageParams};
+use aionui_db::{
+    CreateProviderParams, IConversationRepository, IProviderRepository, MessagePageDirection, MessagePageParams,
+    SqliteProviderRepository,
+};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -14,7 +17,7 @@ use common::{
 };
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
-const DEFAULT_TEAM_AGENT_ID: &str = "2d23ff1c";
+const DEFAULT_TEAM_AGENT_ID: &str = "632f31d2";
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -36,6 +39,28 @@ fn two_agent_body() -> serde_json::Value {
 }
 
 async fn ensure_default_team_agent_installed(services: &aionui_app::AppServices) {
+    let provider_repo = SqliteProviderRepository::new(services.database.pool().clone());
+    provider_repo
+        .create(CreateProviderParams {
+            id: None,
+            platform: "openai",
+            name: "Team E2E Provider",
+            base_url: "https://example.invalid",
+            api_key_encrypted: "stub",
+            models: r#"["claude"]"#,
+            enabled: true,
+            capabilities: "[]",
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}",
+            bedrock_config: None,
+            is_full_url: false,
+        })
+        .await
+        .expect("seed deterministic team provider");
+
     let command = std::env::current_exe()
         .expect("test executable path")
         .to_string_lossy()
@@ -44,7 +69,7 @@ async fn ensure_default_team_agent_installed(services: &aionui_app::AppServices)
 
     sqlx::query(
         "UPDATE agent_metadata \
-         SET agent_source = 'custom', agent_source_info = ?, command = ?, args = '[]', env = '[]', \
+         SET agent_source = 'internal', agent_source_info = ?, command = ?, args = '[]', env = '[]', \
              updated_at = unixepoch('now','subsec') * 1000 \
          WHERE id = ?",
     )
@@ -88,7 +113,7 @@ async fn ensure_default_team_assistant(
     );
 }
 
-async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppServices) {
+async fn mark_hermes_backend_team_mcp_stdio_capable(services: &aionui_app::AppServices) {
     let capabilities = json!({
         "mcp_capabilities": { "stdio": true },
         "shell": true
@@ -97,15 +122,15 @@ async fn mark_claude_backend_team_mcp_stdio_capable(services: &aionui_app::AppSe
     let result = sqlx::query(
         "UPDATE agent_metadata \
          SET agent_capabilities = ?, updated_at = unixepoch('now','subsec') * 1000 \
-         WHERE agent_type = 'acp' AND backend = 'claude'",
+         WHERE agent_type = 'acp' AND backend = 'hermes'",
     )
     .bind(capabilities)
     .execute(services.database.pool())
     .await
-    .expect("mark claude backend as team MCP capable");
+    .expect("mark Hermes backend as team MCP capable");
     assert!(
         result.rows_affected() > 0,
-        "fixture must include claude ACP backend metadata"
+        "fixture must include Hermes ACP backend metadata"
     );
 }
 
@@ -118,8 +143,9 @@ async fn create_team(
     ensure_default_team_assistant(app, services, token, csrf).await;
     let req = json_with_token("POST", "/api/teams", two_agent_body(), token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let status = resp.status();
     let json = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "body = {json}");
     assert!(json["success"].as_bool().unwrap());
     json["data"].clone()
 }
@@ -274,9 +300,11 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
     assert_eq!(extra["teamId"], data["id"]);
     assert!(extra["slot_id"].as_str().is_some_and(|s| !s.is_empty()));
     assert_eq!(extra["role"], "lead");
-    assert_eq!(extra["backend"], "claude");
-    assert_eq!(extra["session_mode"], "bypassPermissions");
-    assert_eq!(extra["current_model_id"], "claude");
+    assert_eq!(extra["backend"], "aionrs");
+    assert_eq!(extra["session_mode"], "yolo");
+    assert_eq!(extra["current_model_id"], Value::Null);
+    let model: Value = serde_json::from_str(row.model.as_deref().expect("aionrs model binding")).unwrap();
+    assert_eq!(model["model"], "claude");
 }
 
 #[tokio::test]
@@ -1044,7 +1072,7 @@ async fn es1_ensure_session() {
 async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    mark_claude_backend_team_mcp_stdio_capable(&services).await;
+    mark_hermes_backend_team_mcp_stdio_capable(&services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
