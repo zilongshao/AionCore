@@ -54,6 +54,7 @@ def verify(source_root: Path) -> None:
     session = importlib.import_module("acp_adapter.session")
     coding_context = importlib.import_module("agent.coding_context")
     model_metadata = importlib.import_module("agent.model_metadata")
+    local_environment = importlib.import_module("tools.environments.local")
     assert session._expand_acp_enabled_toolsets(["hermes-acp-lite"], ["docs"]) == [
         "hermes-acp-lite",
         "mcp-docs",
@@ -218,6 +219,39 @@ def verify(source_root: Path) -> None:
     finally:
         model_metadata._query_ollama_api_show_uncached = original_ollama_probe
         model_metadata._LOCAL_CTX_PROBE_CACHE.clear()
+
+    original_local_is_windows = local_environment._IS_WINDOWS
+    original_bash_starts = local_environment._bash_starts
+    original_which = local_environment.shutil.which
+    explicit_bash = str(source_root / "toolsets.py")
+    previous_explicit_bash = os.environ.get("HERMES_GIT_BASH_PATH")
+
+    try:
+        local_environment._IS_WINDOWS = True
+        local_environment._bash_starts = lambda _path: (_ for _ in ()).throw(
+            AssertionError("explicit Git Bash selection must not run a startup probe")
+        )
+        local_environment.shutil.which = lambda _name: (_ for _ in ()).throw(
+            AssertionError("explicit Git Bash selection must not inspect PATH")
+        )
+        os.environ["HERMES_GIT_BASH_PATH"] = explicit_bash
+        assert local_environment._find_bash() == explicit_bash
+
+        os.environ["HERMES_GIT_BASH_PATH"] = str(source_root / "missing-bash.exe")
+        try:
+            local_environment._find_bash()
+        except RuntimeError as error:
+            assert "does not point to a file" in str(error)
+        else:
+            raise AssertionError("missing explicit Git Bash must fail closed")
+    finally:
+        local_environment._IS_WINDOWS = original_local_is_windows
+        local_environment._bash_starts = original_bash_starts
+        local_environment.shutil.which = original_which
+        if previous_explicit_bash is None:
+            os.environ.pop("HERMES_GIT_BASH_PATH", None)
+        else:
+            os.environ["HERMES_GIT_BASH_PATH"] = previous_explicit_bash
 
     original_endpoint_context = model_metadata._resolve_endpoint_context_length
     original_known_provider = model_metadata._is_known_provider_base_url

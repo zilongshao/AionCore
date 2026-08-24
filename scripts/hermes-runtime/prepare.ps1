@@ -333,6 +333,7 @@ try {
         "agent\coding_context.py",
         "agent\conversation_loop.py",
         "agent\model_metadata.py",
+        "tools\environments\local.py",
         "toolsets.py"
     )) {
         $installedFile = Join-Path $sitePackages $relative

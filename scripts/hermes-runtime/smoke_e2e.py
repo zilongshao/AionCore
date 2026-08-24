@@ -524,7 +524,7 @@ async def run(runtime_root: Path, capture: Path | None) -> dict[str, Any]:
                 f"127.0.0.1:{server.server_port}": "127.0.0.1:<port>",
             }
             result = {
-                "fixture": "hermes-agent/0.19.0+aion.1/win32-x64",
+                "fixture": "hermes-agent/0.19.0+aion.2/win32-x64",
                 "runtimeRoot": str(runtime_root),
                 "elapsedSeconds": round(time.monotonic() - started, 3),
                 "initialize": initialized.model_dump(mode="json", by_alias=True, exclude_none=True),

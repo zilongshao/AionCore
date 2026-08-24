@@ -2002,7 +2002,7 @@ mod tests {
                 ],
             },
             source: ManagedCliLaunchSource::Managed,
-            version: Some("0.19.0+aion.1".to_owned()),
+            version: Some("0.19.0+aion.2".to_owned()),
         };
         reg.launch_plans.write().await.insert(hermes.id.clone(), plan.clone());
         {

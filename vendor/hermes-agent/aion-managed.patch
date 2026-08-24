@@ -607,3 +607,34 @@ index 1be62780..a480a164 100644
 +    },
 +
      "hermes-api-server": {
+diff --git a/tools/environments/local.py b/tools/environments/local.py
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -626,12 +626,23 @@ def _find_bash() -> str:
+             or "/bin/sh"
+         )
+
++    # An embedding host that supplies an explicit Git Bash owns executable
++    # selection.  In particular, the Aion managed runtime points this at its
++    # hash-verified bundled PortableGit.  Do not start another process to probe
++    # this trusted path: under a long-running multithreaded host, Git for
++    # Windows/MSYS startup can block even though the same executable works for
++    # the subsequent tool invocation.  Falling through to user, system, or
++    # PATH candidates would also escape the packaged runtime boundary.
++    custom = os.environ.get("HERMES_GIT_BASH_PATH")
++    if custom:
++        if not os.path.isfile(custom):
++            raise RuntimeError(
++                f"HERMES_GIT_BASH_PATH does not point to a file: {custom}"
++            )
++        return custom
++
+     candidates: list[str] = []
+
+-    custom = os.environ.get("HERMES_GIT_BASH_PATH")
+-    if custom and os.path.isfile(custom):
+-        candidates.append(custom)
+-
+     # Prefer our own portable Git install — a broken or partially-uninstalled
+     # system Git (or a stale HERMES_GIT_BASH_PATH pointing at one) must not
+     # brick the terminal.  install.ps1 drops PortableGit here when needed.

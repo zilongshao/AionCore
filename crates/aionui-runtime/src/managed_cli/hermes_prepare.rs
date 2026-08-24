@@ -17,7 +17,7 @@ use crate::managed_resources_contract::{
 use super::ManagedCliError;
 
 pub const HERMES_AGENT_VERSION: &str = "0.19.0";
-pub const HERMES_MANAGED_VERSION: &str = "0.19.0+aion.1";
+pub const HERMES_MANAGED_VERSION: &str = "0.19.0+aion.2";
 pub const HERMES_AGENT_RELEASE_TAG: &str = "v2026.7.20";
 pub const HERMES_AGENT_COMMIT: &str = "3ef6bbd201263d354fd83ec55b3c306ded2eb72a";
 pub const HERMES_RUNTIME_TARGET: &str = "win32-x64";

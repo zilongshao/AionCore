@@ -27,6 +27,9 @@ timeouts and negative caching, Ollama's native endpoint is explicitly gated,
 and startup stages emit payload-free duration records. ACP sessions also bind
 the editor workspace into the near-task system instruction and per-session
 file-tool schemas so relative paths resolve without asking for the root again.
+When the host supplies `HERMES_GIT_BASH_PATH`, the managed runtime verifies that
+the bundled path is a file and uses it directly, without a startup probe or a
+scan of user and system Git Bash installations.
 
 `runtime-lock.json` pins every downloaded input. The build script verifies the
 official PyPI sdist and wheel checksums, applies the patch to the sdist with
