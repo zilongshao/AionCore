@@ -632,6 +632,7 @@ pub fn build_team_state(
                         assistant_id: assistant.id,
                         name: assistant.name,
                         backend,
+                        agent_source: agent.source,
                         description: assistant.description.unwrap_or_default(),
                         skills: assistant
                             .enabled_skills

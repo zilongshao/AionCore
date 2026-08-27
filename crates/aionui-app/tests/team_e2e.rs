@@ -1,5 +1,6 @@
 mod common;
 
+use aionui_common::ProviderWithModel;
 use aionui_db::{
     CreateProviderParams, IConversationRepository, IProviderRepository, MessagePageDirection, MessagePageParams,
     SqliteProviderRepository,
@@ -18,6 +19,8 @@ use common::{
 
 const DEFAULT_TEAM_ASSISTANT_ID: &str = "team-e2e-assistant";
 const DEFAULT_TEAM_AGENT_ID: &str = "632f31d2";
+const HERMES_TEAM_ASSISTANT_ID: &str = "team-e2e-hermes-assistant";
+const HERMES_AGENT_ID: &str = "55f3ed1c";
 
 fn team_agent(name: &str, role: &str) -> serde_json::Value {
     json!({
@@ -119,12 +122,24 @@ async fn mark_hermes_backend_team_mcp_stdio_capable(services: &aionui_app::AppSe
         "shell": true
     })
     .to_string();
+    let command = std::env::current_exe()
+        .expect("test executable path")
+        .to_string_lossy()
+        .to_string();
+    let source_info = json!({ "binary_name": command }).to_string();
     let result = sqlx::query(
         "UPDATE agent_metadata \
-         SET agent_capabilities = ?, updated_at = unixepoch('now','subsec') * 1000 \
+         SET agent_capabilities = ?, command = ?, agent_source_info = ?, \
+             last_check_status = 'online', last_check_kind = 'manual', \
+             last_check_error_code = NULL, last_check_error_message = NULL, last_check_guidance = NULL, \
+             last_check_at = unixepoch('now','subsec') * 1000, \
+             last_success_at = unixepoch('now','subsec') * 1000, \
+             updated_at = unixepoch('now','subsec') * 1000 \
          WHERE agent_type = 'acp' AND backend = 'hermes'",
     )
     .bind(capabilities)
+    .bind(&command)
+    .bind(source_info)
     .execute(services.database.pool())
     .await
     .expect("mark Hermes backend as team MCP capable");
@@ -132,6 +147,85 @@ async fn mark_hermes_backend_team_mcp_stdio_capable(services: &aionui_app::AppSe
         result.rows_affected() > 0,
         "fixture must include Hermes ACP backend metadata"
     );
+    services
+        .agent_registry
+        .reload_one(HERMES_AGENT_ID)
+        .await
+        .expect("reload Hermes capability update");
+}
+
+async fn create_team_test_provider(
+    services: &aionui_app::AppServices,
+    name: &str,
+    model: &str,
+    enabled: bool,
+) -> aionui_db::models::Provider {
+    let models = serde_json::to_string(&vec![model]).unwrap();
+    SqliteProviderRepository::new(services.database.pool().clone())
+        .create(CreateProviderParams {
+            id: None,
+            platform: "openai",
+            name,
+            base_url: "https://api.openai.com/v1",
+            api_key_encrypted: "stub",
+            models: &models,
+            enabled,
+            capabilities: "[]",
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}",
+            bedrock_config: None,
+            is_full_url: false,
+        })
+        .await
+        .expect("create deterministic Team provider")
+}
+
+async fn ensure_hermes_team_assistant(
+    app: &mut axum::Router,
+    services: &aionui_app::AppServices,
+    token: &str,
+    csrf: &str,
+    model: &str,
+) {
+    mark_hermes_backend_team_mcp_stdio_capable(services).await;
+    let req = json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": HERMES_TEAM_ASSISTANT_ID,
+            "name": "Team E2E Hermes Assistant",
+            "agent_id": HERMES_AGENT_ID,
+            "models": [model],
+            "defaults": {
+                "model": {
+                    "mode": "fixed",
+                    "value": model
+                }
+            }
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "body = {body}");
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/assistants/{HERMES_TEAM_ASSISTANT_ID}"),
+            token,
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["data"]["team_selectable"], true, "body = {body}");
 }
 
 async fn create_team(
@@ -235,6 +329,168 @@ async fn tc2_create_single_agent_team() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     assert_eq!(json["data"]["assistants"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn tc_create_team_with_builtin_hermes_persists_provider_model_binding() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let model = "hermes-team-model";
+    let provider = create_team_test_provider(&services, "Hermes Team Provider", model, true).await;
+    ensure_hermes_team_assistant(&mut app, &services, &token, &csrf, model).await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Team",
+            "agents": [{
+                "name": "Hermes Lead",
+                "role": "lead",
+                "model": "default",
+                "assistant_id": HERMES_TEAM_ASSISTANT_ID
+            }]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "body = {body}");
+
+    let conversation_id = body["data"]["assistants"][0]["conversation_id"]
+        .as_str()
+        .expect("Hermes conversation id");
+    assert_eq!(body["data"]["assistants"][0]["model"], model);
+    let row = services
+        .conversation_repo
+        .get(conversation_id)
+        .await
+        .unwrap()
+        .expect("Hermes conversation row");
+    let binding: ProviderWithModel = serde_json::from_str(row.model.as_deref().expect("Hermes model binding")).unwrap();
+    assert_eq!(binding.provider_id, provider.id);
+    assert_eq!(binding.model, model);
+    assert_eq!(binding.use_model, None);
+
+    let extra: Value = serde_json::from_str(&row.extra).unwrap();
+    assert!(
+        extra.get("provider_id").is_none(),
+        "Hermes backend name must not be persisted as a provider id: {extra}"
+    );
+    assert_eq!(extra["current_model_id"], model);
+}
+
+#[tokio::test]
+async fn tc_create_team_with_builtin_hermes_rejects_missing_provider() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let model = "hermes-model-without-provider";
+    ensure_hermes_team_assistant(&mut app, &services, &token, &csrf, model).await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Missing Provider",
+            "agents": [{
+                "name": "Hermes Lead",
+                "role": "lead",
+                "model": model,
+                "assistant_id": HERMES_TEAM_ASSISTANT_ID
+            }]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires an enabled provider configured for model"),
+        "body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn tc_create_team_with_builtin_hermes_rejects_disabled_provider() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let model = "hermes-disabled-provider-model";
+    create_team_test_provider(&services, "Disabled Hermes Provider", model, false).await;
+    ensure_hermes_team_assistant(&mut app, &services, &token, &csrf, model).await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Disabled Provider",
+            "agents": [{
+                "name": "Hermes Lead",
+                "role": "lead",
+                "model": model,
+                "assistant_id": HERMES_TEAM_ASSISTANT_ID
+            }]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires an enabled provider configured for model"),
+        "body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn tc_create_team_with_builtin_hermes_rejects_ambiguous_provider() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let model = "hermes-ambiguous-model";
+    create_team_test_provider(&services, "Hermes Provider A", model, true).await;
+    create_team_test_provider(&services, "Hermes Provider B", model, true).await;
+    ensure_hermes_team_assistant(&mut app, &services, &token, &csrf, model).await;
+
+    let req = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Ambiguous Provider",
+            "agents": [{
+                "name": "Hermes Lead",
+                "role": "lead",
+                "model": model,
+                "assistant_id": HERMES_TEAM_ASSISTANT_ID
+            }]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("configured by multiple enabled providers"),
+        "body = {body}"
+    );
 }
 
 #[tokio::test]

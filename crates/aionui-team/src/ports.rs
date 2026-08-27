@@ -3,7 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aionui_api_types::{ConversationRuntimeSummary, TeamRunTargetRole};
+use aionui_api_types::{AgentSource, ConversationRuntimeSummary, TeamRunTargetRole};
 use async_trait::async_trait;
 
 use crate::error::TeamError;
@@ -123,6 +123,7 @@ pub struct TeamAssistantCatalogEntry {
     pub assistant_id: String,
     pub name: String,
     pub backend: String,
+    pub agent_source: AgentSource,
     pub description: String,
     pub skills: Vec<String>,
 }

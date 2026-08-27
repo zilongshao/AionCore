@@ -536,6 +536,7 @@ mod tests {
             assistant_id: assistant_id.into(),
             name: name.into(),
             backend: backend.into(),
+            agent_source: aionui_api_types::AgentSource::Builtin,
             description: String::new(),
             skills: Vec::new(),
         }

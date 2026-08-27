@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
+use aionui_api_types::{AddAgentRequest, AgentSource, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
-use aionui_db::models::{AgentMetadataRow, TeamRow};
+use aionui_db::models::{AgentMetadataRow, Provider, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -36,6 +37,7 @@ pub(crate) struct InitialProvisioningResult {
 struct ProvisionedConversation {
     conversation_id: String,
     workspace: Option<String>,
+    model: String,
 }
 
 struct NewAgentProvisioning {
@@ -214,7 +216,7 @@ impl TeamAgentProvisioner {
             role: leader_role,
             conversation_id: leader_conversation.conversation_id,
             backend: leader_backend,
-            model: leader_input.model.clone(),
+            model: leader_conversation.model,
             assistant_id: leader_assistant_id,
             status: None,
             conversation_type: None,
@@ -251,7 +253,7 @@ impl TeamAgentProvisioner {
                 role: *role,
                 conversation_id: conversation.conversation_id,
                 backend,
-                model: input.model.clone(),
+                model: conversation.model,
                 assistant_id,
                 status: None,
                 conversation_type: None,
@@ -517,7 +519,7 @@ impl TeamAgentProvisioner {
             role: input.role,
             conversation_id: conversation.conversation_id,
             backend: input.backend,
-            model: input.model,
+            model: conversation.model,
             assistant_id: input.assistant_id,
             status: None,
             conversation_type: None,
@@ -545,39 +547,69 @@ impl TeamAgentProvisioner {
         } else {
             parse_agent_type(backend)?
         };
+        let selected_agent_source = match assistant_id {
+            Some(assistant_id) => Some(
+                self.assistant_catalog
+                    .resolve_team_selectable_assistant(assistant_id)
+                    .await?
+                    .ok_or_else(|| {
+                        TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                    })?
+                    .agent_source,
+            ),
+            None => None,
+        };
+        let builtin_agent_source = selected_agent_source
+            .map(|source| source == AgentSource::Builtin)
+            .unwrap_or_else(|| {
+                acp_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.agent_source.trim() == "builtin")
+            });
+        let managed_builtin_hermes = is_managed_builtin_hermes(agent_type, backend, builtin_agent_source);
+        let hermes_binding = if managed_builtin_hermes {
+            Some(self.resolve_hermes_model_binding(model).await?)
+        } else {
+            None
+        };
+        let effective_model = hermes_binding
+            .as_ref()
+            .map(|binding| binding.model.clone())
+            .unwrap_or_else(|| model.to_owned());
         let extra = self.build_team_extra(
             team_id,
             slot_id,
             role,
             backend,
-            model,
+            &effective_model,
             assistant_id,
             workspace,
             agent_type,
             acp_metadata.as_ref(),
             session_mode,
         );
-        let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(model)
+        let top_level_model = if agent_type == AgentType::Aionrs {
+            let provider_id = self
+                .resolve_provider_for_model(&effective_model)
                 .await
-                .unwrap_or_else(|| backend.to_owned())
+                .unwrap_or_else(|| backend.to_owned());
+            Some(ProviderWithModel {
+                provider_id,
+                model: effective_model.clone(),
+                use_model: None,
+            })
         } else {
-            backend.to_owned()
+            hermes_binding
         };
-        let (top_level_model, extra) = if agent_type == AgentType::Aionrs {
-            (
-                Some(ProviderWithModel {
-                    provider_id,
-                    model: model.to_owned(),
-                    use_model: None,
-                }),
-                extra,
-            )
+        let extra = if agent_type == AgentType::Aionrs {
+            extra
         } else {
             let mut extra = extra;
-            extra["provider_id"] = serde_json::Value::String(provider_id);
-            extra["current_model_id"] = serde_json::Value::String(model.to_owned());
-            (None, extra)
+            if !managed_builtin_hermes {
+                extra["provider_id"] = serde_json::Value::String(backend.to_owned());
+            }
+            extra["current_model_id"] = serde_json::Value::String(effective_model.clone());
+            extra
         };
         let created = self
             .conversation_port
@@ -602,6 +634,7 @@ impl TeamAgentProvisioner {
         Ok(ProvisionedConversation {
             conversation_id: conv_id,
             workspace: Some(resolved_workspace),
+            model: effective_model,
         })
     }
 
@@ -710,6 +743,95 @@ impl TeamAgentProvisioner {
         }
         None
     }
+
+    async fn resolve_hermes_model_binding(&self, model: &str) -> Result<ProviderWithModel, TeamError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(TeamError::InvalidRequest(
+                "Hermes requires a selected model when creating a Team member".into(),
+            ));
+        }
+
+        let providers = self.provider_repo.list().await?;
+        if model == "default" {
+            let mut candidates = providers
+                .into_iter()
+                .filter(|provider| provider.enabled)
+                .filter_map(|provider| {
+                    enabled_provider_models(&provider)
+                        .into_iter()
+                        .next()
+                        .map(|model| (provider.id, model))
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| left.0.cmp(&right.0));
+            candidates.dedup_by(|left, right| left.0 == right.0);
+            return match candidates.as_slice() {
+                [(provider_id, model)] => Ok(ProviderWithModel {
+                    provider_id: provider_id.clone(),
+                    model: model.clone(),
+                    use_model: None,
+                }),
+                [] => Err(TeamError::InvalidRequest(
+                    "Hermes requires an enabled provider with at least one enabled model".into(),
+                )),
+                _ => Err(TeamError::InvalidRequest(format!(
+                    "Hermes default model is ambiguous across multiple enabled providers ({}); select a concrete model",
+                    candidates
+                        .iter()
+                        .map(|(provider_id, _)| provider_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))),
+            };
+        }
+
+        let mut provider_ids = providers
+            .into_iter()
+            .filter(|provider| provider.enabled)
+            .filter_map(|provider| {
+                enabled_provider_models(&provider)
+                    .iter()
+                    .any(|candidate| candidate == model)
+                    .then_some(provider.id)
+            })
+            .collect::<Vec<_>>();
+        provider_ids.sort();
+        provider_ids.dedup();
+
+        match provider_ids.as_slice() {
+            [provider_id] => Ok(ProviderWithModel {
+                provider_id: provider_id.clone(),
+                model: model.to_owned(),
+                use_model: None,
+            }),
+            [] => Err(TeamError::InvalidRequest(format!(
+                "Hermes requires an enabled provider configured for model '{model}'"
+            ))),
+            _ => Err(TeamError::InvalidRequest(format!(
+                "Hermes model '{model}' is configured by multiple enabled providers ({}); select a model with a unique provider",
+                provider_ids.join(", ")
+            ))),
+        }
+    }
+}
+
+fn enabled_provider_models(provider: &Provider) -> Vec<String> {
+    let models = serde_json::from_str::<Vec<String>>(&provider.models).unwrap_or_default();
+    let enabled = provider
+        .model_enabled
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<HashMap<String, bool>>(value).ok())
+        .unwrap_or_default();
+    models
+        .into_iter()
+        .filter(|model| !model.trim().is_empty())
+        .filter(|model| enabled.get(model).copied().unwrap_or(true))
+        .collect()
+}
+
+fn is_managed_builtin_hermes(agent_type: AgentType, backend: &str, builtin_agent_source: bool) -> bool {
+    agent_type == AgentType::Acp && backend.trim() == "hermes" && builtin_agent_source
 }
 
 #[cfg(test)]
@@ -724,6 +846,14 @@ mod tests {
     use aionui_db::{CreateProviderParams, DbError, UpdateProviderParams};
     use std::sync::Mutex;
     use tokio::sync::watch;
+
+    #[test]
+    fn managed_hermes_binding_only_applies_to_builtin_acp_backend() {
+        assert!(is_managed_builtin_hermes(AgentType::Acp, "hermes", true));
+        assert!(!is_managed_builtin_hermes(AgentType::Acp, "hermes", false));
+        assert!(!is_managed_builtin_hermes(AgentType::Acp, "claude", true));
+        assert!(!is_managed_builtin_hermes(AgentType::Aionrs, "hermes", true));
+    }
 
     struct RecordingProvisioningPort {
         events: Arc<Mutex<Vec<&'static str>>>,
@@ -928,6 +1058,64 @@ mod tests {
         }
     }
 
+    struct RowsProviderRepo {
+        rows: Vec<Provider>,
+    }
+
+    #[async_trait]
+    impl IProviderRepository for RowsProviderRepo {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            Ok(self.rows.clone())
+        }
+        async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
+            Ok(self.rows.iter().find(|provider| provider.id == id).cloned())
+        }
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            Err(DbError::Init("unused".into()))
+        }
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
+    fn provider_row(id: &str, models: &[&str]) -> Provider {
+        Provider {
+            id: id.into(),
+            platform: "openai".into(),
+            name: id.into(),
+            base_url: "https://example.com/v1".into(),
+            api_key_encrypted: String::new(),
+            models: serde_json::to_string(models).unwrap(),
+            enabled: true,
+            capabilities: "[]".into(),
+            context_limit: None,
+            model_protocols: None,
+            model_enabled: None,
+            model_health: None,
+            model_settings: "{}".into(),
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn provisioner_with_providers(rows: Vec<Provider>) -> TeamAgentProvisioner {
+        TeamAgentProvisioner::new(
+            Arc::new(crate::test_utils::MockTeamRepo::new()),
+            Arc::new(UnusedAgentMetadataRepo),
+            Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(RowsProviderRepo { rows }),
+            Arc::new(RecordingProvisioningPort {
+                events: Arc::new(Mutex::new(Vec::new())),
+                patches: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+    }
+
     fn test_provisioner(events: Arc<Mutex<Vec<&'static str>>>) -> TeamAgentProvisioner {
         test_provisioner_with_patches(events, Arc::new(Mutex::new(Vec::new())))
     }
@@ -958,6 +1146,44 @@ mod tests {
             conversation_type: None,
             cli_path: None,
         }
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_default_resolves_first_enabled_model_from_unique_provider() {
+        let mut provider = provider_row(
+            "provider-1",
+            &["model-disabled", "deepseek-v4-flash", "deepseek-v4-pro"],
+        );
+        provider.model_enabled = Some(
+            serde_json::json!({
+                "model-disabled": false,
+                "deepseek-v4-flash": true,
+                "deepseek-v4-pro": true
+            })
+            .to_string(),
+        );
+        let provisioner = provisioner_with_providers(vec![provider]);
+
+        let binding = provisioner.resolve_hermes_model_binding("default").await.unwrap();
+
+        assert_eq!(binding.provider_id, "provider-1");
+        assert_eq!(binding.model, "deepseek-v4-flash");
+        assert_eq!(binding.use_model, None);
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_default_rejects_multiple_enabled_providers() {
+        let provisioner = provisioner_with_providers(vec![
+            provider_row("provider-1", &["model-a"]),
+            provider_row("provider-2", &["model-b"]),
+        ]);
+
+        let error = provisioner
+            .resolve_hermes_model_binding("default")
+            .await
+            .expect_err("default provider must be unambiguous");
+
+        assert!(error.to_string().contains("default model is ambiguous"));
     }
 
     fn test_mcp_config() -> TeamMcpStdioConfig {

@@ -1290,6 +1290,7 @@ impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
                 assistant_id: definition.assistant_id,
                 name: definition.name,
                 backend,
+                agent_source: aionui_api_types::AgentSource::Builtin,
                 description: definition.description.unwrap_or_default(),
                 skills: Vec::new(),
             });
