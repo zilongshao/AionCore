@@ -110,6 +110,17 @@ pub fn build_teammate_prompt_for_transport(
     })
 }
 
+
+const TEAM_LANGUAGE_POLICY: &str = r#"## 强制语言要求
+
+- 本轮所有自然语言内容必须直接使用简体中文生成。
+- 这包括内部推理、`reasoning_content`、thinking、计划、工具调用理由、团队通信、进度说明和最终回答。
+- 禁止先用英文推理，再把最终答案翻译成中文。
+- 代码、命令、路径、标识符、API 字段名和原始错误信息可以保留原文。
+- 除非用户明确要求其他语言，否则不得使用英文进行自然语言推理或回答。
+
+"#;
+
 pub fn build_wake_payload(
     agent: &TeamAgent,
     tasks: &[TeamTask],
@@ -117,6 +128,9 @@ pub fn build_wake_payload(
     current_slot_ids: &HashSet<String>,
 ) -> String {
     let mut payload = String::with_capacity(2048);
+
+    // 每次唤醒都重新强化语言约束。
+    payload.push_str(TEAM_LANGUAGE_POLICY);
 
     if !unread_messages.is_empty() {
         payload.push_str("## New Messages\n\n");
@@ -139,7 +153,11 @@ pub fn build_wake_payload(
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
     }
 
-    payload.push_str(&wake_summary::render_task_board_summary(agent, tasks, current_slot_ids));
+    payload.push_str(&wake_summary::render_task_board_summary(
+        agent,
+        tasks,
+        current_slot_ids,
+    ));
 
     payload.push_str(&format!(
         "You are **{}** (role: {}). Proceed with your work.\n",
@@ -247,6 +265,16 @@ mod tests {
         assert!(!prompt.contains("- Lead (acp, status:"));
         assert!(!prompt.contains("- Worker1 (acp, status:"));
         assert!(prompt.contains("team_members"));
+    }
+
+    #[test]
+    fn wake_payload_requires_chinese_reasoning() {
+        let agent = make_lead();
+        let payload = build_wake_payload(&agent, &[], &[], &HashSet::new());
+
+        assert!(payload.starts_with("## 强制语言要求"));
+        assert!(payload.contains("reasoning_content"));
+        assert!(payload.contains("禁止先用英文推理"));
     }
 
     #[test]

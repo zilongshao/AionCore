@@ -715,6 +715,7 @@ mod tests {
                     role: "teammate".into(),
                     backend: None,
                     model: "gpt-5-mini".into(),
+                    provider_id: None,
                     assistant_id: Some("word-creator".into()),
                 },
             )
@@ -764,6 +765,7 @@ mod tests {
                 name: "Spawned".into(),
                 backend: "acp".into(),
                 model: "claude".into(),
+                provider_id: None,
                 assistant_id: None,
             })
             .await

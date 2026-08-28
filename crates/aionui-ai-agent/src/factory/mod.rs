@@ -6,6 +6,8 @@ pub(crate) mod aionrs;
 mod context;
 mod hermes_session;
 
+pub use hermes_session::validate_managed_hermes_provider;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

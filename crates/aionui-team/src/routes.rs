@@ -51,6 +51,52 @@ impl From<TeamError> for ApiError {
                     ApiError::BadRequest(msg)
                 }
             }
+            TeamError::ProviderSelectionRequired { selections } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_PROVIDER_SELECTION_REQUIRED",
+                "A provider must be selected for one or more team members",
+                Some(serde_json::json!({ "selections": selections })),
+            ),
+            TeamError::ProviderSelectionInvalid {
+                agent_index,
+                provider_id,
+                requested_model,
+            } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "TEAM_PROVIDER_SELECTION_INVALID",
+                format!("Selected provider '{provider_id}' is not available for model '{requested_model}'"),
+                Some(serde_json::json!({
+                    "agent_index": agent_index,
+                    "provider_id": provider_id,
+                    "requested_model": requested_model,
+                })),
+            ),
+            TeamError::ProviderNotAvailable {
+                agent_index,
+                requested_model,
+            } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "TEAM_PROVIDER_NOT_AVAILABLE",
+                format!("No provider is available for model '{requested_model}'"),
+                Some(serde_json::json!({
+                    "agent_index": agent_index,
+                    "requested_model": requested_model,
+                })),
+            ),
+            TeamError::ModelNotAvailable {
+                agent_index,
+                provider_id,
+                requested_model,
+            } => ApiError::coded(
+                StatusCode::BAD_REQUEST,
+                "TEAM_MODEL_NOT_AVAILABLE",
+                format!("Model '{requested_model}' is not available from provider '{provider_id}'"),
+                Some(serde_json::json!({
+                    "agent_index": agent_index,
+                    "provider_id": provider_id,
+                    "requested_model": requested_model,
+                })),
+            ),
             TeamError::LeaderOnly(msg) => ApiError::Forbidden(msg),
             TeamError::Forbidden(msg) => ApiError::Forbidden(msg),
             TeamError::SessionNotFound(msg) => ApiError::NotFound(msg),
@@ -381,6 +427,7 @@ async fn stop_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::{TeamProviderCandidate, TeamProviderSelection};
     use serde_json::json;
 
     #[test]
@@ -411,6 +458,48 @@ mod tests {
     fn invalid_request_maps_to_bad_request() {
         let err: ApiError = TeamError::InvalidRequest("empty agents".into()).into();
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn provider_selection_required_maps_to_safe_coded_conflict() {
+        let err: ApiError = TeamError::ProviderSelectionRequired {
+            selections: vec![TeamProviderSelection {
+                agent_index: 1,
+                agent_name: "Worker".into(),
+                assistant_id: "assistant-hermes".into(),
+                requested_model: "default".into(),
+                candidates: vec![TeamProviderCandidate {
+                    provider_id: "provider-1".into(),
+                    provider_name: "Provider One".into(),
+                    platform: "openai".into(),
+                    resolved_model: "model-a".into(),
+                }],
+            }],
+        }
+        .into();
+
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "TEAM_PROVIDER_SELECTION_REQUIRED");
+        assert_eq!(
+            err.error_details(),
+            Some(json!({
+                "selections": [{
+                    "agent_index": 1,
+                    "agent_name": "Worker",
+                    "assistant_id": "assistant-hermes",
+                    "requested_model": "default",
+                    "candidates": [{
+                        "provider_id": "provider-1",
+                        "provider_name": "Provider One",
+                        "platform": "openai",
+                        "resolved_model": "model-a",
+                    }],
+                }],
+            }))
+        );
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("base_url"));
     }
 
     #[test]

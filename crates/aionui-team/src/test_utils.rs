@@ -1078,6 +1078,7 @@ pub(crate) mod workspace_harness {
                 role: "lead".into(),
                 backend: Some("acp".into()),
                 model: "claude".into(),
+                provider_id: None,
                 assistant_id: None,
                 conversation_id: None,
             }],

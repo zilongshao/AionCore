@@ -2265,6 +2265,7 @@ mod tests {
                     role: "lead".into(),
                     backend: Some("acp".into()),
                     model: "claude".into(),
+                    provider_id: None,
                     assistant_id: None,
                     conversation_id: None,
                 },
@@ -2273,6 +2274,7 @@ mod tests {
                     role: "teammate".into(),
                     backend: Some("acp".into()),
                     model: "claude".into(),
+                    provider_id: None,
                     assistant_id: None,
                     conversation_id: None,
                 },
@@ -2288,6 +2290,7 @@ mod tests {
             role: "teammate".into(),
             backend: Some("aionrs".into()),
             model: "claude-sonnet".into(),
+            provider_id: None,
             assistant_id: None,
             conversation_id: None,
         });
@@ -2703,6 +2706,7 @@ mod tests {
                     role: "teammate".to_owned(),
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
+                    provider_id: None,
                     assistant_id: None,
                 },
             )
@@ -2778,6 +2782,7 @@ mod tests {
                 role: "teammate".to_owned(),
                 backend: Some("acp".to_owned()),
                 model: "claude".to_owned(),
+                provider_id: None,
                 assistant_id: None,
             },
         )
@@ -2817,6 +2822,7 @@ mod tests {
                     role: "teammate".to_owned(),
                     backend: Some("acp".to_owned()),
                     model: "claude".to_owned(),
+                    provider_id: None,
                     assistant_id: None,
                 },
             )

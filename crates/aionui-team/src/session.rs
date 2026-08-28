@@ -1531,6 +1531,7 @@ impl TeamSession {
                 name: requested_name,
                 backend,
                 model,
+                provider_id: None,
                 assistant_id: Some(assistant_id.to_owned()),
             })
             .await?;

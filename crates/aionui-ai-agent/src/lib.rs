@@ -42,7 +42,7 @@ pub use capability::skill_manager::{
     prepare_first_message_with_skills_index,
 };
 pub use error::AgentError;
-pub use factory::{AgentFactoryDeps, build_agent_factory};
+pub use factory::{AgentFactoryDeps, build_agent_factory, validate_managed_hermes_provider};
 pub use idle_scanner::{
     IdleCleanupCoordinator, resolve_idle_config_from_env, start_idle_scanner, start_idle_scanner_with_coordinator,
 };

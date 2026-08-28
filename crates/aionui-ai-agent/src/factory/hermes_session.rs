@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use aionui_common::{CommandSpec, EnvVar, ProviderWithModel};
 use aionui_db::IProviderRepository;
+use aionui_db::models::Provider;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -145,6 +146,31 @@ async fn resolve_provider(
         .map_err(|error| AgentError::internal(format!("Failed to load Hermes provider config: {error}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
+    validate_managed_hermes_provider(&row, &model_id)?;
+
+    let base_url = row.base_url.trim();
+    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, encryption_key).map_err(|error| {
+        AgentError::internal(format!(
+            "Failed to decrypt API key for Hermes provider '{provider_id}': {error}"
+        ))
+    })?;
+
+    Ok(ResolvedHermesProvider {
+        base_url: base_url.to_owned(),
+        api_key,
+        model: model_id,
+        provider_type: hermes_provider_type(&row.platform, base_url).to_owned(),
+        context_limit: row.context_limit.filter(|limit| *limit > 0),
+    })
+}
+
+/// Validate the static provider properties required by Aion-managed Hermes.
+///
+/// Team provisioning uses the same check before offering provider candidates,
+/// while runtime startup repeats it against the latest database row. API-key
+/// decryption remains a runtime-only check and is intentionally excluded here.
+pub fn validate_managed_hermes_provider(row: &Provider, model_id: &str) -> Result<(), AgentError> {
+    let provider_id = row.id.as_str();
     if !row.enabled {
         return Err(AgentError::bad_request(format!("Provider '{provider_id}' is disabled")));
     }
@@ -161,26 +187,13 @@ async fn resolve_provider(
         )));
     }
 
-    let transport = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
+    let transport = map_aionrs_provider(&row.platform, model_id, row.model_protocols.as_deref())?;
     if transport != "openai" {
         return Err(AgentError::bad_request(format!(
             "Hermes beta requires an OpenAI-compatible provider; provider '{provider_id}' resolves to '{transport}'"
         )));
     }
-
-    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, encryption_key).map_err(|error| {
-        AgentError::internal(format!(
-            "Failed to decrypt API key for Hermes provider '{provider_id}': {error}"
-        ))
-    })?;
-
-    Ok(ResolvedHermesProvider {
-        base_url: base_url.to_owned(),
-        api_key,
-        model: model_id,
-        provider_type: hermes_provider_type(&row.platform, base_url).to_owned(),
-        context_limit: row.context_limit.filter(|limit| *limit > 0),
-    })
+    Ok(())
 }
 
 fn hermes_provider_type(platform: &str, base_url: &str) -> &'static str {

@@ -19,6 +19,8 @@ pub struct TeamAgentInput {
     pub role: String,
     pub backend: Option<String>,
     pub model: String,
+    /// User-selected provider for provider-backed agents.
+    pub provider_id: Option<String>,
     pub assistant_id: Option<String>,
     /// Deprecated request-side field retained so old clients receive a clear
     /// validation error instead of silently reusing a solo conversation.
@@ -35,6 +37,8 @@ struct TeamAgentInputCompat {
     pub name: String,
     pub role: String,
     pub model: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
     #[serde(default)]
     pub conversation_id: Option<String>,
 }
@@ -59,6 +63,7 @@ impl<'de> Deserialize<'de> for TeamAgentInput {
             role: raw.role,
             backend: None,
             model: raw.model,
+            provider_id: raw.provider_id,
             assistant_id: Some(assistant_id),
             conversation_id: raw.conversation_id,
         })
@@ -98,6 +103,7 @@ pub struct AddAgentRequest {
     pub role: String,
     pub backend: Option<String>,
     pub model: String,
+    pub provider_id: Option<String>,
     pub assistant_id: Option<String>,
 }
 
@@ -112,6 +118,8 @@ struct AddAgentRequestCompat {
     role: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
     #[serde(default)]
     assistant_id: Option<String>,
 }
@@ -128,6 +136,7 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
                 role: assistant.role,
                 backend: None,
                 model: assistant.model,
+                provider_id: assistant.provider_id,
                 assistant_id: assistant.assistant_id,
             });
         }
@@ -143,9 +152,32 @@ impl<'de> Deserialize<'de> for AddAgentRequest {
             role,
             backend: None,
             model,
+            provider_id: raw.provider_id,
             assistant_id: Some(assistant_id),
         })
     }
+}
+
+/// Safe provider summary returned when Team creation needs user disambiguation.
+///
+/// This deliberately excludes credentials, endpoints, headers, and provider
+/// settings so it is safe to include in an API error response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamProviderCandidate {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub platform: String,
+    pub resolved_model: String,
+}
+
+/// Provider choice required for one Team member in the submitted request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamProviderSelection {
+    pub agent_index: usize,
+    pub agent_name: String,
+    pub assistant_id: String,
+    pub requested_model: String,
+    pub candidates: Vec<TeamProviderCandidate>,
 }
 
 /// Request body for `PATCH /api/teams/:id/agents/:slotId/name`.
@@ -615,6 +647,7 @@ mod tests {
                     "name": "Lead",
                     "role": "lead",
                     "model": "claude",
+                    "provider_id": "provider-x",
                     "assistant_id": "assistant-x"
                 },
                 {
@@ -632,8 +665,10 @@ mod tests {
         assert_eq!(req.agents[0].role, "lead");
         assert!(req.agents[0].backend.is_none());
         assert_eq!(req.agents[0].model, "claude");
+        assert_eq!(req.agents[0].provider_id.as_deref(), Some("provider-x"));
         assert_eq!(req.agents[0].assistant_id.as_deref(), Some("assistant-x"));
         assert_eq!(req.agents[1].name, "Worker");
+        assert!(req.agents[1].provider_id.is_none());
         assert_eq!(req.agents[1].assistant_id.as_deref(), Some("assistant-y"));
     }
 
@@ -777,6 +812,7 @@ mod tests {
             "name": "Helper",
             "role": "teammate",
             "model": "claude",
+            "provider_id": "provider-1",
             "assistant_id": "assistant-1"
         });
         let req: AddAgentRequest = serde_json::from_value(raw).unwrap();
@@ -784,6 +820,7 @@ mod tests {
         assert_eq!(req.role, "teammate");
         assert!(req.backend.is_none());
         assert_eq!(req.model, "claude");
+        assert_eq!(req.provider_id.as_deref(), Some("provider-1"));
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
     }
 
@@ -818,6 +855,7 @@ mod tests {
                 "name": "Helper",
                 "role": "teammate",
                 "model": "claude",
+                "provider_id": "provider-2",
                 "assistant_id": "assistant-1"
             }
         });
@@ -825,6 +863,7 @@ mod tests {
         assert_eq!(req.name, "Helper");
         assert_eq!(req.role, "teammate");
         assert_eq!(req.model, "claude");
+        assert_eq!(req.provider_id.as_deref(), Some("provider-2"));
         assert_eq!(req.assistant_id.as_deref(), Some("assistant-1"));
         assert!(req.backend.is_none());
     }

@@ -1,3 +1,4 @@
+use aionui_api_types::TeamProviderSelection;
 use serde_json::{Value, json};
 
 #[derive(Debug, thiserror::Error)]
@@ -13,6 +14,29 @@ pub enum TeamError {
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("A provider must be selected for one or more team members")]
+    ProviderSelectionRequired { selections: Vec<TeamProviderSelection> },
+
+    #[error("Selected provider '{provider_id}' is not available for model '{requested_model}'")]
+    ProviderSelectionInvalid {
+        agent_index: usize,
+        provider_id: String,
+        requested_model: String,
+    },
+
+    #[error("No provider is available for model '{requested_model}'")]
+    ProviderNotAvailable {
+        agent_index: usize,
+        requested_model: String,
+    },
+
+    #[error("Model '{requested_model}' is not available from provider '{provider_id}'")]
+    ModelNotAvailable {
+        agent_index: usize,
+        provider_id: String,
+        requested_model: String,
+    },
 
     #[error("Leader-only action: {0}")]
     LeaderOnly(String),

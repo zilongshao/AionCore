@@ -17,7 +17,20 @@ Required Team behavior:
 - Use `team_send_message` for Team reporting instead of ordinary assistant replies.
 - Use `team_task_update` and `team_task_list` for task-board state.
 - Follow role permissions. Lead-only tools cannot be used by teammates.
-- Domain-specific assistant rules, MCP servers, and skills remain active only inside these Team boundaries."#;
+- Domain-specific assistant rules, MCP servers, and skills remain active only inside these Team boundaries.
+
+## Language Policy (CRITICAL)
+
+- Use Simplified Chinese for all generated natural-language content.
+- This requirement applies to internal reasoning, chain-of-thought,
+  reasoning_content, thinking content, planning, tool-call rationale,
+  inter-agent communication, progress updates, and final answers.
+- Do not reason in English and then translate the final answer into Chinese.
+- Code, commands, paths, identifiers, API field names, and verbatim error
+  messages may remain in their original language.
+- Unless the user explicitly requests another language, Simplified Chinese
+  is mandatory throughout the entire generation process.
+"#;
 
 pub fn with_team_governance(role_prompt: &str) -> String {
     format!("{TEAM_GOVERNANCE_PROMPT}\n\n{role_prompt}")

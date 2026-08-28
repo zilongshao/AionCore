@@ -408,14 +408,9 @@ async fn tc_create_team_with_builtin_hermes_rejects_missing_provider() {
     let status = resp.status();
     let body = body_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
-    assert_eq!(body["code"], "BAD_REQUEST");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("requires an enabled provider configured for model"),
-        "body = {body}"
-    );
+    assert_eq!(body["code"], "TEAM_PROVIDER_NOT_AVAILABLE");
+    assert_eq!(body["details"]["agent_index"], 0);
+    assert_eq!(body["details"]["requested_model"], model);
 }
 
 #[tokio::test]
@@ -445,52 +440,177 @@ async fn tc_create_team_with_builtin_hermes_rejects_disabled_provider() {
     let status = resp.status();
     let body = body_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
-    assert_eq!(body["code"], "BAD_REQUEST");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("requires an enabled provider configured for model"),
-        "body = {body}"
-    );
+    assert_eq!(body["code"], "TEAM_PROVIDER_NOT_AVAILABLE");
+    assert_eq!(body["details"]["agent_index"], 0);
+    assert_eq!(body["details"]["requested_model"], model);
 }
 
 #[tokio::test]
-async fn tc_create_team_with_builtin_hermes_rejects_ambiguous_provider() {
+async fn tc_create_team_with_builtin_hermes_selects_provider_without_partial_creation() {
     let (mut app, services) = build_app_with_mock_agents().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let model = "hermes-ambiguous-model";
-    create_team_test_provider(&services, "Hermes Provider A", model, true).await;
-    create_team_test_provider(&services, "Hermes Provider B", model, true).await;
+    let provider_a = create_team_test_provider(&services, "Hermes Provider A", model, true).await;
+    let provider_b = create_team_test_provider(&services, "Hermes Provider B", model, true).await;
     ensure_hermes_team_assistant(&mut app, &services, &token, &csrf, model).await;
+
+    let conversation_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let team_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
 
     let req = json_with_token(
         "POST",
         "/api/teams",
         json!({
             "name": "Hermes Ambiguous Provider",
-            "agents": [{
-                "name": "Hermes Lead",
-                "role": "lead",
-                "model": model,
-                "assistant_id": HERMES_TEAM_ASSISTANT_ID
-            }]
+            "agents": [
+                {
+                    "name": "Hermes Lead",
+                    "role": "lead",
+                    "model": model,
+                    "provider_id": provider_a.id,
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                },
+                {
+                    "name": "Hermes Worker",
+                    "role": "teammate",
+                    "model": model,
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                }
+            ]
         }),
         &token,
         &csrf,
     );
-    let resp = app.oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {body}");
+    assert_eq!(body["code"], "TEAM_PROVIDER_SELECTION_REQUIRED");
+    let selections = body["details"]["selections"].as_array().expect("provider selections");
+    assert_eq!(selections.len(), 1, "body = {body}");
+    assert_eq!(selections[0]["agent_index"], 1);
+    assert_eq!(selections[0]["agent_name"], "Hermes Worker");
+    assert_eq!(selections[0]["assistant_id"], HERMES_TEAM_ASSISTANT_ID);
+    assert_eq!(selections[0]["requested_model"], model);
+    let candidates = selections[0]["candidates"].as_array().expect("provider candidates");
+    assert_eq!(candidates.len(), 2, "body = {body}");
+    let mut candidate_ids = candidates
+        .iter()
+        .map(|candidate| candidate["provider_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    candidate_ids.sort();
+    let mut expected_ids = vec![provider_a.id.clone(), provider_b.id.clone()];
+    expected_ids.sort();
+    assert_eq!(candidate_ids, expected_ids);
+    for candidate in candidates {
+        assert_eq!(candidate["platform"], "openai");
+        assert_eq!(candidate["resolved_model"], model);
+        assert!(candidate["provider_name"].is_string());
+        assert!(candidate.get("api_key").is_none());
+        assert!(candidate.get("base_url").is_none());
+    }
+    let rendered = body.to_string();
+    assert!(!rendered.contains("https://api.openai.com/v1"));
+    assert!(!rendered.contains("stub"));
+
+    let conversation_count_after_conflict: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let team_count_after_conflict: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(conversation_count_after_conflict, conversation_count_before);
+    assert_eq!(team_count_after_conflict, team_count_before);
+
+    let invalid_retry = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Ambiguous Provider",
+            "agents": [
+                {
+                    "name": "Hermes Lead",
+                    "role": "lead",
+                    "model": model,
+                    "provider_id": provider_a.id,
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                },
+                {
+                    "name": "Hermes Worker",
+                    "role": "teammate",
+                    "model": model,
+                    "provider_id": "missing-provider",
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                }
+            ]
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(invalid_retry).await.unwrap();
     let status = resp.status();
     let body = body_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
-    assert_eq!(body["code"], "BAD_REQUEST");
-    assert!(
-        body["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("configured by multiple enabled providers"),
-        "body = {body}"
+    assert_eq!(body["code"], "TEAM_PROVIDER_SELECTION_INVALID");
+    assert_eq!(body["details"]["agent_index"], 1);
+    assert_eq!(body["details"]["provider_id"], "missing-provider");
+    assert_eq!(body["details"]["requested_model"], model);
+
+    let retry = json_with_token(
+        "POST",
+        "/api/teams",
+        json!({
+            "name": "Hermes Ambiguous Provider",
+            "agents": [
+                {
+                    "name": "Hermes Lead",
+                    "role": "lead",
+                    "model": model,
+                    "provider_id": provider_a.id,
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                },
+                {
+                    "name": "Hermes Worker",
+                    "role": "teammate",
+                    "model": model,
+                    "provider_id": provider_b.id,
+                    "assistant_id": HERMES_TEAM_ASSISTANT_ID
+                }
+            ]
+        }),
+        &token,
+        &csrf,
     );
+    let resp = app.oneshot(retry).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "body = {body}");
+
+    for assistant in body["data"]["assistants"].as_array().expect("created assistants") {
+        let expected_provider_id = match assistant["name"].as_str().unwrap() {
+            "Hermes Lead" => &provider_a.id,
+            "Hermes Worker" => &provider_b.id,
+            name => panic!("unexpected assistant {name}"),
+        };
+        let conversation_id = assistant["conversation_id"].as_str().unwrap();
+        let row = services
+            .conversation_repo
+            .get(conversation_id)
+            .await
+            .unwrap()
+            .expect("Hermes conversation row");
+        let binding: ProviderWithModel = serde_json::from_str(row.model.as_deref().unwrap()).unwrap();
+        assert_eq!(&binding.provider_id, expected_provider_id);
+        assert_eq!(binding.model, model);
+    }
 }
 
 #[tokio::test]

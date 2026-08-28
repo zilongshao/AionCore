@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aionui_ai_agent::IWorkerTaskManager;
-use aionui_api_types::{AddAgentRequest, AgentSource, GetConfigOptionsResponse, TeamAgentInput, TeamToolTransport};
+use aionui_ai_agent::{IWorkerTaskManager, validate_managed_hermes_provider};
+use aionui_api_types::{
+    AddAgentRequest, AgentSource, GetConfigOptionsResponse, TeamAgentInput, TeamProviderCandidate,
+    TeamProviderSelection, TeamToolTransport,
+};
 use aionui_common::{AgentKillReason, AgentType, ProviderWithModel, generate_id};
 use aionui_db::models::{AgentMetadataRow, Provider, TeamRow};
 use aionui_db::{IAgentMetadataRepository, IProviderRepository, ITeamRepository, UpdateTeamParams};
@@ -48,6 +51,7 @@ struct NewAgentProvisioning {
     role: TeammateRole,
     backend: String,
     model: String,
+    provider_id: Option<String>,
     assistant_id: Option<String>,
     workspace: Option<String>,
     session_mode: Option<String>,
@@ -60,7 +64,14 @@ pub(crate) struct PersistSpawnedAgentRequest {
     pub name: String,
     pub backend: String,
     pub model: String,
+    pub provider_id: Option<String>,
     pub assistant_id: Option<String>,
+}
+
+#[derive(Debug)]
+enum HermesBindingResolution {
+    Resolved(ProviderWithModel),
+    SelectionRequired(Vec<TeamProviderCandidate>),
 }
 
 pub struct TeamConversationCreateRequest {
@@ -175,6 +186,11 @@ impl TeamAgentProvisioner {
             ));
         };
 
+        // Resolve every Hermes provider/model binding before creating any
+        // conversation. A provider-selection response must be side-effect free,
+        // including when the ambiguous member is not the leader.
+        let mut hermes_bindings = self.prepare_initial_hermes_bindings(inputs).await?;
+
         let leader_input = &inputs[*leader_idx];
         let leader_slot_id = generate_id();
         let leader_role = TeammateRole::Lead;
@@ -191,9 +207,12 @@ impl TeamAgentProvisioner {
                 &leader_input.name,
                 &leader_backend,
                 &leader_input.model,
+                leader_input.provider_id.as_deref(),
                 leader_assistant_id.as_deref(),
                 shared_workspace,
                 None,
+                *leader_idx,
+                hermes_bindings.remove(leader_idx),
             )
             .await?;
 
@@ -223,10 +242,11 @@ impl TeamAgentProvisioner {
             cli_path: None,
         });
 
-        for (input, role) in inputs
+        for (input_idx, (input, role)) in inputs
             .iter()
             .zip(roles.iter())
-            .filter(|(_, role)| **role == TeammateRole::Teammate)
+            .enumerate()
+            .filter(|(_, (_, role))| **role == TeammateRole::Teammate)
         {
             let slot_id = generate_id();
             let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
@@ -242,9 +262,12 @@ impl TeamAgentProvisioner {
                     &input.name,
                     &backend,
                     &input.model,
+                    input.provider_id.as_deref(),
                     assistant_id.as_deref(),
                     Some(&team_workspace),
                     None,
+                    input_idx,
+                    hermes_bindings.remove(&input_idx),
                 )
                 .await?;
             agents.push(TeamAgent {
@@ -307,6 +330,7 @@ impl TeamAgentProvisioner {
                 role,
                 backend,
                 model: req.model,
+                provider_id: req.provider_id,
                 assistant_id,
                 workspace: Some(workspace),
                 session_mode: row.session_mode.clone(),
@@ -359,6 +383,7 @@ impl TeamAgentProvisioner {
                 role: TeammateRole::Teammate,
                 backend: req.backend,
                 model: req.model,
+                provider_id: req.provider_id,
                 assistant_id: req.assistant_id,
                 workspace: Some(workspace),
                 session_mode: row.session_mode.clone(),
@@ -508,9 +533,12 @@ impl TeamAgentProvisioner {
                 &input.name,
                 &input.backend,
                 &input.model,
+                input.provider_id.as_deref(),
                 input.assistant_id.as_deref(),
                 input.workspace.as_deref(),
                 input.session_mode.as_deref(),
+                0,
+                None,
             )
             .await?;
         Ok(TeamAgent {
@@ -537,9 +565,12 @@ impl TeamAgentProvisioner {
         name: &str,
         backend: &str,
         model: &str,
+        selected_provider_id: Option<&str>,
         assistant_id: Option<&str>,
         workspace: Option<&str>,
         session_mode: Option<&str>,
+        agent_index: usize,
+        pre_resolved_hermes_binding: Option<ProviderWithModel>,
     ) -> Result<ProvisionedConversation, TeamError> {
         let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
         let agent_type = if acp_metadata.is_some() {
@@ -568,7 +599,20 @@ impl TeamAgentProvisioner {
             });
         let managed_builtin_hermes = is_managed_builtin_hermes(agent_type, backend, builtin_agent_source);
         let hermes_binding = if managed_builtin_hermes {
-            Some(self.resolve_hermes_model_binding(model).await?)
+            match pre_resolved_hermes_binding {
+                Some(binding) => Some(binding),
+                None => match self
+                    .resolve_hermes_model_binding(model, selected_provider_id, agent_index)
+                    .await?
+                {
+                    HermesBindingResolution::Resolved(binding) => Some(binding),
+                    HermesBindingResolution::SelectionRequired(candidates) => {
+                        return Err(TeamError::ProviderSelectionRequired {
+                            selections: vec![provider_selection(agent_index, name, assistant_id, model, candidates)],
+                        });
+                    }
+                },
+            }
         } else {
             None
         };
@@ -744,7 +788,94 @@ impl TeamAgentProvisioner {
         None
     }
 
-    async fn resolve_hermes_model_binding(&self, model: &str) -> Result<ProviderWithModel, TeamError> {
+    async fn prepare_initial_hermes_bindings(
+        &self,
+        inputs: &[TeamAgentInput],
+    ) -> Result<HashMap<usize, ProviderWithModel>, TeamError> {
+        let mut bindings = HashMap::new();
+        let mut selections = Vec::new();
+
+        for (agent_index, input) in inputs.iter().enumerate() {
+            let assistant_id = Self::effective_assistant_id(input.assistant_id.as_deref());
+            let backend = self
+                .resolve_requested_backend(input.backend.as_deref(), assistant_id.as_deref())
+                .await?;
+            if !self
+                .is_managed_builtin_hermes_target(&backend, assistant_id.as_deref())
+                .await?
+            {
+                continue;
+            }
+
+            match self
+                .resolve_hermes_model_binding(&input.model, input.provider_id.as_deref(), agent_index)
+                .await?
+            {
+                HermesBindingResolution::Resolved(binding) => {
+                    bindings.insert(agent_index, binding);
+                }
+                HermesBindingResolution::SelectionRequired(candidates) => {
+                    info!(
+                        agent_index,
+                        candidate_count = candidates.len(),
+                        "Hermes provider selection required"
+                    );
+                    selections.push(provider_selection(
+                        agent_index,
+                        &input.name,
+                        assistant_id.as_deref(),
+                        &input.model,
+                        candidates,
+                    ));
+                }
+            }
+        }
+
+        if !selections.is_empty() {
+            return Err(TeamError::ProviderSelectionRequired { selections });
+        }
+        Ok(bindings)
+    }
+
+    async fn is_managed_builtin_hermes_target(
+        &self,
+        backend: &str,
+        assistant_id: Option<&str>,
+    ) -> Result<bool, TeamError> {
+        let acp_metadata = acp_backend_metadata(&self.agent_metadata_repo, backend).await?;
+        let agent_type = if acp_metadata.is_some() {
+            AgentType::Acp
+        } else {
+            parse_agent_type(backend)?
+        };
+        let selected_agent_source = match assistant_id {
+            Some(assistant_id) => Some(
+                self.assistant_catalog
+                    .resolve_team_selectable_assistant(assistant_id)
+                    .await?
+                    .ok_or_else(|| {
+                        TeamError::InvalidRequest(format!("Assistant is not available for team mode: {assistant_id}"))
+                    })?
+                    .agent_source,
+            ),
+            None => None,
+        };
+        let builtin_agent_source = selected_agent_source
+            .map(|source| source == AgentSource::Builtin)
+            .unwrap_or_else(|| {
+                acp_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.agent_source.trim() == "builtin")
+            });
+        Ok(is_managed_builtin_hermes(agent_type, backend, builtin_agent_source))
+    }
+
+    async fn resolve_hermes_model_binding(
+        &self,
+        model: &str,
+        selected_provider_id: Option<&str>,
+        agent_index: usize,
+    ) -> Result<HermesBindingResolution, TeamError> {
         let model = model.trim();
         if model.is_empty() {
             return Err(TeamError::InvalidRequest(
@@ -753,66 +884,110 @@ impl TeamAgentProvisioner {
         }
 
         let providers = self.provider_repo.list().await?;
-        if model == "default" {
-            let mut candidates = providers
-                .into_iter()
-                .filter(|provider| provider.enabled)
-                .filter_map(|provider| {
-                    enabled_provider_models(&provider)
-                        .into_iter()
-                        .next()
-                        .map(|model| (provider.id, model))
-                })
-                .collect::<Vec<_>>();
-            candidates.sort_by(|left, right| left.0.cmp(&right.0));
-            candidates.dedup_by(|left, right| left.0 == right.0);
-            return match candidates.as_slice() {
-                [(provider_id, model)] => Ok(ProviderWithModel {
-                    provider_id: provider_id.clone(),
-                    model: model.clone(),
-                    use_model: None,
-                }),
-                [] => Err(TeamError::InvalidRequest(
-                    "Hermes requires an enabled provider with at least one enabled model".into(),
-                )),
-                _ => Err(TeamError::InvalidRequest(format!(
-                    "Hermes default model is ambiguous across multiple enabled providers ({}); select a concrete model",
-                    candidates
-                        .iter()
-                        .map(|(provider_id, _)| provider_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))),
+        if let Some(provider_id) = selected_provider_id
+            .map(str::trim)
+            .filter(|provider_id| !provider_id.is_empty())
+        {
+            let Some(provider) = providers.iter().find(|provider| provider.id == provider_id) else {
+                return Err(TeamError::ProviderSelectionInvalid {
+                    agent_index,
+                    provider_id: provider_id.to_owned(),
+                    requested_model: model.to_owned(),
+                });
             };
+            if !provider.enabled {
+                return Err(TeamError::ProviderSelectionInvalid {
+                    agent_index,
+                    provider_id: provider_id.to_owned(),
+                    requested_model: model.to_owned(),
+                });
+            }
+            let Some(resolved_model) = resolved_hermes_model(provider, model) else {
+                return Err(TeamError::ModelNotAvailable {
+                    agent_index,
+                    provider_id: provider_id.to_owned(),
+                    requested_model: model.to_owned(),
+                });
+            };
+            if validate_managed_hermes_provider(provider, &resolved_model).is_err() {
+                return Err(TeamError::ProviderSelectionInvalid {
+                    agent_index,
+                    provider_id: provider_id.to_owned(),
+                    requested_model: model.to_owned(),
+                });
+            }
+            info!(
+                agent_index,
+                provider_id,
+                model = %resolved_model,
+                "Hermes provider binding selected"
+            );
+            return Ok(HermesBindingResolution::Resolved(ProviderWithModel {
+                provider_id: provider_id.to_owned(),
+                model: resolved_model,
+                use_model: None,
+            }));
         }
 
-        let mut provider_ids = providers
-            .into_iter()
-            .filter(|provider| provider.enabled)
+        let mut candidates = providers
+            .iter()
             .filter_map(|provider| {
-                enabled_provider_models(&provider)
-                    .iter()
-                    .any(|candidate| candidate == model)
-                    .then_some(provider.id)
+                let resolved_model = resolved_hermes_model(provider, model)?;
+                validate_managed_hermes_provider(provider, &resolved_model).ok()?;
+                Some(TeamProviderCandidate {
+                    provider_id: provider.id.clone(),
+                    provider_name: provider.name.clone(),
+                    platform: provider.platform.clone(),
+                    resolved_model,
+                })
             })
             .collect::<Vec<_>>();
-        provider_ids.sort();
-        provider_ids.dedup();
+        candidates.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
+        candidates.dedup_by(|left, right| left.provider_id == right.provider_id);
 
-        match provider_ids.as_slice() {
-            [provider_id] => Ok(ProviderWithModel {
-                provider_id: provider_id.clone(),
-                model: model.to_owned(),
+        match candidates.as_slice() {
+            [candidate] => Ok(HermesBindingResolution::Resolved(ProviderWithModel {
+                provider_id: candidate.provider_id.clone(),
+                model: candidate.resolved_model.clone(),
                 use_model: None,
+            })),
+            [] => Err(TeamError::ProviderNotAvailable {
+                agent_index,
+                requested_model: model.to_owned(),
             }),
-            [] => Err(TeamError::InvalidRequest(format!(
-                "Hermes requires an enabled provider configured for model '{model}'"
-            ))),
-            _ => Err(TeamError::InvalidRequest(format!(
-                "Hermes model '{model}' is configured by multiple enabled providers ({}); select a model with a unique provider",
-                provider_ids.join(", ")
-            ))),
+            _ => Ok(HermesBindingResolution::SelectionRequired(candidates)),
         }
+    }
+}
+
+fn provider_selection(
+    agent_index: usize,
+    agent_name: &str,
+    assistant_id: Option<&str>,
+    requested_model: &str,
+    candidates: Vec<TeamProviderCandidate>,
+) -> TeamProviderSelection {
+    TeamProviderSelection {
+        agent_index,
+        agent_name: agent_name.to_owned(),
+        assistant_id: assistant_id.unwrap_or_default().to_owned(),
+        requested_model: requested_model.to_owned(),
+        candidates,
+    }
+}
+
+fn resolved_hermes_model(provider: &Provider, requested_model: &str) -> Option<String> {
+    if !provider.enabled {
+        return None;
+    }
+    let models = enabled_provider_models(provider);
+    if requested_model == "default" {
+        models.into_iter().next()
+    } else {
+        models
+            .into_iter()
+            .any(|candidate| candidate == requested_model)
+            .then(|| requested_model.to_owned())
     }
 }
 
@@ -1164,7 +1339,13 @@ mod tests {
         );
         let provisioner = provisioner_with_providers(vec![provider]);
 
-        let binding = provisioner.resolve_hermes_model_binding("default").await.unwrap();
+        let HermesBindingResolution::Resolved(binding) = provisioner
+            .resolve_hermes_model_binding("default", None, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("unique provider must resolve directly");
+        };
 
         assert_eq!(binding.provider_id, "provider-1");
         assert_eq!(binding.model, "deepseek-v4-flash");
@@ -1172,18 +1353,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_hermes_default_rejects_multiple_enabled_providers() {
+    async fn managed_hermes_default_returns_multiple_provider_candidates() {
         let provisioner = provisioner_with_providers(vec![
             provider_row("provider-1", &["model-a"]),
             provider_row("provider-2", &["model-b"]),
         ]);
 
-        let error = provisioner
-            .resolve_hermes_model_binding("default")
+        let HermesBindingResolution::SelectionRequired(candidates) = provisioner
+            .resolve_hermes_model_binding("default", None, 0)
             .await
-            .expect_err("default provider must be unambiguous");
+            .unwrap()
+        else {
+            panic!("multiple providers must require selection");
+        };
 
-        assert!(error.to_string().contains("default model is ambiguous"));
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].provider_id, "provider-1");
+        assert_eq!(candidates[0].resolved_model, "model-a");
+        assert_eq!(candidates[1].provider_id, "provider-2");
+        assert_eq!(candidates[1].resolved_model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_selected_provider_resolves_ambiguous_concrete_model() {
+        let provisioner = provisioner_with_providers(vec![
+            provider_row("provider-1", &["shared-model"]),
+            provider_row("provider-2", &["shared-model"]),
+        ]);
+
+        let HermesBindingResolution::Resolved(binding) = provisioner
+            .resolve_hermes_model_binding("shared-model", Some("provider-2"), 3)
+            .await
+            .unwrap()
+        else {
+            panic!("a valid selected provider must resolve directly");
+        };
+
+        assert_eq!(binding.provider_id, "provider-2");
+        assert_eq!(binding.model, "shared-model");
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_selected_provider_resolves_default_within_that_provider() {
+        let provisioner = provisioner_with_providers(vec![
+            provider_row("provider-1", &["model-a"]),
+            provider_row("provider-2", &["model-b", "model-c"]),
+        ]);
+
+        let HermesBindingResolution::Resolved(binding) = provisioner
+            .resolve_hermes_model_binding("default", Some("provider-2"), 2)
+            .await
+            .unwrap()
+        else {
+            panic!("default must resolve within the selected provider");
+        };
+
+        assert_eq!(binding.provider_id, "provider-2");
+        assert_eq!(binding.model, "model-b");
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_rejects_unknown_selected_provider_with_agent_context() {
+        let provisioner = provisioner_with_providers(vec![provider_row("provider-1", &["model-a"])]);
+
+        let error = provisioner
+            .resolve_hermes_model_binding("model-a", Some("missing-provider"), 4)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::ProviderSelectionInvalid {
+                agent_index: 4,
+                ref provider_id,
+                ref requested_model,
+            } if provider_id == "missing-provider" && requested_model == "model-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_rejects_model_missing_from_selected_provider() {
+        let provisioner = provisioner_with_providers(vec![provider_row("provider-1", &["model-a"])]);
+
+        let error = provisioner
+            .resolve_hermes_model_binding("model-b", Some("provider-1"), 1)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TeamError::ModelNotAvailable {
+                agent_index: 1,
+                ref provider_id,
+                ref requested_model,
+            } if provider_id == "provider-1" && requested_model == "model-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_hermes_excludes_statically_incompatible_provider_from_candidates() {
+        let compatible = provider_row("provider-1", &["shared-model"]);
+        let mut full_url = provider_row("provider-2", &["shared-model"]);
+        full_url.is_full_url = true;
+        let provisioner = provisioner_with_providers(vec![compatible, full_url]);
+
+        let HermesBindingResolution::Resolved(binding) = provisioner
+            .resolve_hermes_model_binding("shared-model", None, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("only the compatible provider must remain");
+        };
+
+        assert_eq!(binding.provider_id, "provider-1");
     }
 
     fn test_mcp_config() -> TeamMcpStdioConfig {
