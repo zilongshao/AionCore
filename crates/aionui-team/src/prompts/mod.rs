@@ -110,7 +110,6 @@ pub fn build_teammate_prompt_for_transport(
     })
 }
 
-
 const TEAM_LANGUAGE_POLICY: &str = r#"## 强制语言要求
 
 - 本轮所有自然语言内容必须直接使用简体中文生成。
@@ -153,11 +152,7 @@ pub fn build_wake_payload(
         payload.push_str("## New Messages\n\nNo new messages.\n\n");
     }
 
-    payload.push_str(&wake_summary::render_task_board_summary(
-        agent,
-        tasks,
-        current_slot_ids,
-    ));
+    payload.push_str(&wake_summary::render_task_board_summary(agent, tasks, current_slot_ids));
 
     payload.push_str(&format!(
         "You are **{}** (role: {}). Proceed with your work.\n",

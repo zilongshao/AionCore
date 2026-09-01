@@ -249,6 +249,9 @@ pub enum AgentKillReason {
     /// The requested runtime capabilities changed, so the in-memory task must
     /// be rebuilt before handling the next turn.
     RuntimeCapabilityChanged,
+    /// The requested workspace differs from the cached agent workspace, so the
+    /// in-memory task must be rebuilt before handling the next turn.
+    WorkspaceChanged,
 }
 
 /// Preview content type for document preview history.
